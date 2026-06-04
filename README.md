@@ -10,7 +10,7 @@ ACT-Break is a white-box analysis framework for studying jailbreak direction vec
 | --- | --- | --- | --- |
 | **1. Activation Compass** | **Completed** | Extracts refusal vs. compliance activation direction vector (`V_jailbreak`). | Probes trained on layers L12-L18 (100% accuracy, AUC 1.00). Selected L12 as the best layer. Cosine similarity between probe weight and mean-difference direction: **0.9962**. |
 | **2. Suffix Discovery Engine** | **Completed** | Optimizes adversarial suffixes using GCG guided by a combined loss (Target CE Loss + Activation Projection Loss). | GCG Optimization Success: **10/10 (100%)**. Confirmed Jailbreaks (true alignment bypass): **7/10 (70%)**. Converges in average ~50 steps. |
-| **3. Multi-stage Validation** | *Up Next* | Evaluates transferability, perplexity filters, topic relevance, and defense resistance. | *To be implemented.* |
+| **3. Multi-stage Validation** | **Completed** | Evaluates transferability, perplexity filters, topic relevance, and defense resistance. | Average Suffix Transfer Rate: **57.8%**. Adversarial suffixes show **166x higher perplexity** than baseline. Logit Lens enables **step-1 detection** of jailbreaks during token generation. |
 
 ---
 
@@ -57,6 +57,13 @@ All execution scripts are located under the `scripts/` directory and should be r
    ```
    *(Optimizes adversarial suffixes of length 20 using GCG, guided by target token cross-entropy loss and activation projection loss onto `V_jailbreak`. Includes a final comparative test showing jailbreak confirmation rate against original prompts).*
 
+### Module 3: Multi-stage Validation
+6. **Run Multi-stage Validation**:
+   ```bash
+   uv run python scripts/06_multi_stage_validation.py
+   ```
+   *(Orchestrates cross-validation matrix calculation, conditioned suffix perplexity scoring, step-by-step logit lens trajectory tracking on layer L12, and embedding-based topic relevance analysis).*
+
 ---
 
 ## Technical Details
@@ -92,6 +99,12 @@ All execution scripts are located under the `scripts/` directory and should be r
   - **20% False Positive**: Prompts that the model naturally complied with even without suffixes (manipulation tutorial, dangerous behavior posts - the 0.5B model lacks strict safety alignment on these).
   - **10% Semantic Drift**: One prompt (bomb-making tutorial) succeeded GCG check but resulted in the model talking about "OSAS (Open Source Software Assembly)" instead of explosives.
 
+### Module 3 Validation
+* **Transferability Matrix**: Diagonal (Self) Success: **100%**. Average Suffix Transfer Rate: **57.8%**. Prompt vulnerability to other suffixes: **57.8%**. Suffix 1 (exploit) is the most transferable with a **88.9% transfer success rate**.
+* **Perplexity Check**: Adversarial suffixes show **166x higher perplexity** (Mean PPL: 41,181.02) compared to baseline 'Sure, here is' compliance prefix (Mean PPL: 247.97). This provides an easy black-box filter defense.
+* **Logit Lens Tracking**: Successfully shows that intermediate hidden states on layer L12 jump to the positive V_jailbreak (compliance) region at step 1 during jailbroken generation, compared to remaining negative for original prompts.
+* **Topic Relevance**: Cosine similarity averages **0.5536** between prompt and response embeddings.
+
 ---
 
 ## Project Structure
@@ -113,19 +126,22 @@ ACT-Break/
 |   |-- activation_steering.py      # Causal activation steering implementation
 |   |-- loss_functions.py           # Multi-objective CE + activation loss functions
 |   |-- token_gradients.py          # Token-level gradients calculator (one-hot trick)
-|   `-- gcg_optimizer.py            # GCG optimization loop with mini-batching
+|   |-- gcg_optimizer.py            # GCG optimization loop with mini-batching
+|   `-- validation.py               # [NEW] Multi-stage Validation library
 |-- scripts/
 |   |-- 01_collect_activations.py   # Run: collect model activations
 |   |-- 02_train_probe.py           # Run: train linear probes
 |   |-- 03_extract_direction.py     # Run: extract jailbreak direction vector
 |   |-- 04_steering_validation.py   # Run: steering validation sweep
-|   `-- 05_optimize_suffix.py       # Run: suffix optimization & comparison tests
+|   |-- 05_optimize_suffix.py       # Run: suffix optimization & comparison tests
+|   `-- 06_multi_stage_validation.py # [NEW] Run: multi-stage validation checks
 `-- outputs/                        # Artifacts, plots, and models (git ignored)
     |-- activations/                # Saved hidden states
     |-- probes/                     # Saved probes and validation results
     |-- figures/                    # PCA and projection plots
     |-- steering/                   # Activation steering results
-    `-- optimization/               # Optimized suffixes, loss curves, and summary
+    |-- optimization/               # Optimized suffixes, loss curves, and summary
+    `-- validation/                 # [NEW] Validation reports and heatmaps
 ```
 
 ## License

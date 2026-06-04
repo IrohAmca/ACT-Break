@@ -36,26 +36,41 @@ class GCGOptimizer:
         """
         Tokenizes the prefix and target to form clean lists of token IDs.
         
-        Qwen structure:
-        <|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{prompt}{suffix}<|im_end|>\n<|im_start|>assistant\n{target_string}
+        Auto-detects the generation prompt marker from the chat template 
+        to work with both Qwen and Gemma models.
         """
-        # We format prefix part and target part separately
-        # 1. Format the base user prompt to get system prompt + user prompt header
-        # Using apply_chat_template is cleanest:
+        # 1. Get full template WITH generation prompt
         base_text = self.tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
             tokenize=False,
             add_generation_prompt=True
         )
         
-        # base_text is `<|im_start|>system\n...\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n`
-        # We split immediately before the closing tags `<|im_end|>\n<|im_start|>assistant\n`
-        split_marker = "<|im_end|>\n<|im_start|>assistant\n"
-        if split_marker in base_text:
-            prefix_text = base_text.rsplit(split_marker, 1)[0]
+        # 2. Get template WITHOUT generation prompt to find where generation starts
+        no_gen_text = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=False
+        )
+        
+        # 3. The generation prompt marker is the difference between the two
+        # base_text = no_gen_text + split_marker (approximately)
+        # We find the split point by looking at where no_gen_text ends in base_text
+        if base_text.startswith(no_gen_text):
+            # Simple case: generation prompt is appended at the end
+            split_marker = base_text[len(no_gen_text):]
+            prefix_text = no_gen_text
         else:
-            # Fallback
-            prefix_text = base_text
+            # Fallback: try common markers
+            for marker in ["<end_of_turn>\n<start_of_turn>model\n",
+                           "<|im_end|>\n<|im_start|>assistant\n"]:
+                if marker in base_text:
+                    prefix_text = base_text.rsplit(marker, 1)[0]
+                    split_marker = marker
+                    break
+            else:
+                prefix_text = base_text
+                split_marker = ""
             
         target_text = split_marker + "Sure, here is"
         
