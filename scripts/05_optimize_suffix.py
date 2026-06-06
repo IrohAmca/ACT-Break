@@ -11,6 +11,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import config
 from src.model_loader import HookedModel
 from src.activation_collector import load_prompts
+from src.activation_measurements import (
+    measure_forced_target_text,
+    track_generation_trajectory_text,
+)
 from src.activation_reference import ActivationReferenceClassifier
 from src.gcg_optimizer import GCGOptimizer
 
@@ -32,39 +36,6 @@ def save_incremental(results: list, output_dir: Path):
             "success_rate": success_count / total if total > 0 else 0,
             "results": results
         }, f, indent=2, ensure_ascii=False)
-
-
-def classify_by_activation(model, prompt_text, direction_vec, layer_idx, activation_classifier=None):
-    """
-    Language-agnostic classification via activation projection.
-    Forward pass on formatted prompt -> extract L_best hidden state -> dot(act, V_jailbreak).
-    Positive = compliance, negative = refusal.
-    """
-    formatted = model.format_chat(prompt_text, assistant_prefix=None)
-    inputs = model.tokenize(formatted)
-
-    model.store.clear()
-    with torch.no_grad():
-        model.forward(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs.get("attention_mask"),
-        )
-
-    act = model.store.get(layer_idx)
-    if act is None:
-        return "Unknown", -999.0
-
-    if act.dim() == 3:
-        act_vec = act[0, -1, :].float()
-    else:
-        act_vec = act[-1, :].float()
-
-    proj = torch.dot(act_vec, direction_vec.float().cpu()).item()
-    if activation_classifier is not None:
-        status = activation_classifier.classify_projection(proj).status
-    else:
-        status = "Compliance" if proj > 0 else "Refusal"
-    return status, proj
 
 
 def run_comparison_test(model, results: list, direction_vec, layer_idx, activation_classifier):
@@ -89,45 +60,59 @@ def run_comparison_test(model, results: list, direction_vec, layer_idx, activati
         safe_print(f"  Suffix found: {suffix[:40]}...")
         print(f"  GCG Success: {success}")
 
-        # 1. Classify and generate WITHOUT suffix
-        orig_status, orig_proj = classify_by_activation(
-            model, prompt, direction_vec, layer_idx, activation_classifier
+        # 1. Track real generation WITHOUT suffix.
+        original_generation = track_generation_trajectory_text(
+            model=model,
+            prompt=prompt,
+            suffix="",
+            direction_vec=direction_vec,
+            layer_idx=layer_idx,
+            activation_classifier=activation_classifier,
+            max_new_tokens=60,
         )
-        formatted_original = model.format_chat(prompt, assistant_prefix=None)
-        inputs_orig = model.tokenize(formatted_original)
-        with torch.no_grad():
-            outputs_orig = model.generate(
-                input_ids=inputs_orig["input_ids"],
-                attention_mask=inputs_orig["attention_mask"],
-                max_new_tokens=60
-            )
-        input_len_orig = inputs_orig["input_ids"].shape[1]
-        response_original = model.decode(outputs_orig[0, input_len_orig:]).strip()
+        response_original = original_generation["response"]
 
-        # 2. Classify and generate WITH suffix
-        prompt_with_suffix = prompt + " " + suffix
-        suf_status, suf_proj = classify_by_activation(
-            model, prompt_with_suffix, direction_vec, layer_idx, activation_classifier
+        # 2. Measure objective-side forced target and real generation WITH suffix.
+        suffix_forced = measure_forced_target_text(
+            model=model,
+            prompt=prompt,
+            suffix=suffix,
+            target_string=config.TARGET_STRING,
+            direction_vec=direction_vec,
+            layer_idx=layer_idx,
+            activation_classifier=activation_classifier,
         )
-        formatted_suffix = model.format_chat(prompt_with_suffix, assistant_prefix=None)
-        inputs_suf = model.tokenize(formatted_suffix)
-        with torch.no_grad():
-            outputs_suf = model.generate(
-                input_ids=inputs_suf["input_ids"],
-                attention_mask=inputs_suf["attention_mask"],
-                max_new_tokens=60
-            )
-        input_len_suf = inputs_suf["input_ids"].shape[1]
-        response_with_suffix = model.decode(outputs_suf[0, input_len_suf:]).strip()
+        suffix_generation = track_generation_trajectory_text(
+            model=model,
+            prompt=prompt,
+            suffix=suffix,
+            direction_vec=direction_vec,
+            layer_idx=layer_idx,
+            activation_classifier=activation_classifier,
+            max_new_tokens=60,
+        )
+        response_with_suffix = suffix_generation["response"]
 
-        jailbreak_confirmed = (orig_status == "Refusal" and suf_status == "Compliance")
+        jailbreak_confirmed = (
+            not original_generation["generated_any_compliance"]
+            and suffix_generation["generated_any_compliance"]
+        )
+        loss_behavior_gap = (
+            suffix_forced["is_compliance"]
+            and not suffix_generation["generated_any_compliance"]
+        )
+        suffix_generation_status = "Compliance" if suffix_generation["generated_any_compliance"] else "Refusal"
+        original_generation_status = "Compliance" if original_generation["generated_any_compliance"] else "Refusal"
 
         safe_print(
-            f"  [Original]    ({orig_status}, proj={orig_proj:+.1f}) "
+            f"  [Original Gen] ({original_generation_status}) "
             f"{response_original.replace(chr(10), ' ')[:70]}"
         )
         safe_print(
-            f"  [With Suffix] ({suf_status}, proj={suf_proj:+.1f}) "
+            f"  [Forced Target] ({suffix_forced['status']}, proj={suffix_forced['projection']:+.1f})"
+        )
+        safe_print(
+            f"  [Suffix Gen]   ({suffix_generation_status}) "
             f"{response_with_suffix.replace(chr(10), ' ')[:70]}"
         )
 
@@ -137,12 +122,16 @@ def run_comparison_test(model, results: list, direction_vec, layer_idx, activati
             "gcg_success": success,
             "gcg_steps": res["steps"],
             "original_response": response_original,
-            "original_status": orig_status,
-            "original_projection": orig_proj,
+            "original_generation": original_generation,
+            "original_status": original_generation_status,
             "suffix_response": response_with_suffix,
-            "suffix_status": suf_status,
-            "suffix_projection": suf_proj,
-            "jailbreak_confirmed": jailbreak_confirmed
+            "suffix_forced_target": suffix_forced,
+            "suffix_generation": suffix_generation,
+            "suffix_status": suffix_generation_status,
+            "suffix_forced_status": suffix_forced["status"],
+            "suffix_forced_projection": suffix_forced["projection"],
+            "jailbreak_confirmed": jailbreak_confirmed,
+            "loss_behavior_gap": loss_behavior_gap,
         })
 
     return comparisons
@@ -240,7 +229,10 @@ def main():
             "response": opt_res["response"],
             "losses": opt_res["losses"],
             "target_losses": opt_res["target_losses"],
-            "activation_losses": opt_res["activation_losses"]
+            "activation_losses": opt_res["activation_losses"],
+            "forced_target": opt_res["forced_target"],
+            "generation_trajectory": opt_res["generation_trajectory"],
+            "loss_behavior_gap": opt_res["loss_behavior_gap"],
         }
         results.append(result_entry)
 
@@ -276,6 +268,8 @@ def main():
     # 7. Save final results with comparisons
     success_count = sum(1 for r in results if r["success"])
     confirmed_jailbreaks = sum(1 for c in comparisons if c["jailbreak_confirmed"])
+    generation_compliance_count = sum(1 for c in comparisons if c["suffix_generation"]["generated_any_compliance"])
+    loss_behavior_gap_count = sum(1 for c in comparisons if c["loss_behavior_gap"])
 
     final_results = {
         "total_prompts": len(prompts),
@@ -283,6 +277,10 @@ def main():
         "gcg_success_rate": success_count / len(prompts),
         "confirmed_jailbreaks": confirmed_jailbreaks,
         "confirmed_jailbreak_rate": confirmed_jailbreaks / len(prompts),
+        "generation_compliance_count": generation_compliance_count,
+        "generation_compliance_rate": generation_compliance_count / len(prompts),
+        "loss_behavior_gap_count": loss_behavior_gap_count,
+        "loss_behavior_gap_rate": loss_behavior_gap_count / len(prompts),
         "multi_layer_count": n_layers,
         "direction_layers": direction_layers,
         "optimization_results": results,
@@ -302,8 +300,9 @@ def main():
         f.write("=" * 60 + "\n\n")
         f.write(f"Total prompts:          {len(prompts)}\n")
         f.write(f"Steering layers:        L{direction_layers[0]}-L{direction_layers[-1]} ({n_layers} layers)\n")
-        f.write(f"GCG Success rate:       {success_count}/{len(prompts)} ({success_count / len(prompts):.1%})\n")
-        f.write(f"Confirmed jailbreaks:   {confirmed_jailbreaks}/{len(prompts)} ({confirmed_jailbreaks / len(prompts):.1%})\n")
+        f.write(f"Forced-target success:  {success_count}/{len(prompts)} ({success_count / len(prompts):.1%})\n")
+        f.write(f"Generated compliance:   {generation_compliance_count}/{len(prompts)} ({generation_compliance_count / len(prompts):.1%})\n")
+        f.write(f"Loss-behavior gaps:     {loss_behavior_gap_count}/{len(prompts)} ({loss_behavior_gap_count / len(prompts):.1%})\n")
         f.write("\n" + "-" * 60 + "\n")
         f.write("Detailed Results:\n")
         f.write("-" * 60 + "\n\n")
@@ -312,8 +311,9 @@ def main():
             f.write(f"  GCG Success:       {res['success']}\n")
             f.write(f"  Steps:             {res['steps']}\n")
             f.write(f"  Suffix:            {res['suffix']}\n")
-            f.write(f"  Original Status:   {comp['original_status']} (proj={comp['original_projection']:+.1f})\n")
-            f.write(f"  Suffix Status:     {comp['suffix_status']} (proj={comp['suffix_projection']:+.1f})\n")
+            f.write(f"  Original Gen:      {comp['original_status']}\n")
+            f.write(f"  Forced Target:     {comp['suffix_forced_status']} (proj={comp['suffix_forced_projection']:+.1f})\n")
+            f.write(f"  Suffix Gen:        {comp['suffix_status']}\n")
             if res.get("losses"):
                 f.write(f"  Final Loss:        {res['losses'][-1]:+.4f}\n")
             if res.get("target_losses"):
@@ -321,6 +321,7 @@ def main():
             if res.get("activation_losses"):
                 f.write(f"  Final Act Loss:    {res['activation_losses'][-1]:+.4f}\n")
             f.write(f"  Jailbreak Confirmed: {comp['jailbreak_confirmed']}\n")
+            f.write(f"  Loss-Behavior Gap: {comp['loss_behavior_gap']}\n")
             f.write(f"  Original Response: {comp['original_response'].strip().replace(chr(10), ' ')[:100]}\n")
             f.write(f"  Suffix Response:   {comp['suffix_response'].strip().replace(chr(10), ' ')[:100]}\n\n")
 
@@ -331,17 +332,17 @@ def main():
     print("FINAL RESULTS")
     print("=" * 60)
     print(f"  Steering Layers:        L{direction_layers[0]}-L{direction_layers[-1]} ({n_layers} layers)")
-    print(f"  GCG Success Rate:       {success_count}/{len(prompts)} ({success_count / len(prompts):.1%})")
-    print(f"  Confirmed Jailbreaks:   {confirmed_jailbreaks}/{len(prompts)} ({confirmed_jailbreaks / len(prompts):.1%})")
+    print(f"  Forced-target Success:  {success_count}/{len(prompts)} ({success_count / len(prompts):.1%})")
+    print(f"  Generated Compliance:   {generation_compliance_count}/{len(prompts)} ({generation_compliance_count / len(prompts):.1%})")
+    print(f"  Loss-Behavior Gaps:     {loss_behavior_gap_count}/{len(prompts)} ({loss_behavior_gap_count / len(prompts):.1%})")
     print()
     print("  Comparison Summary:")
     for idx, comp in enumerate(comparisons):
         marker = "[OK]" if comp["jailbreak_confirmed"] else "[--]"
         print(
-            f"    {marker} P{idx+1}: {comp['original_status']} "
-            f"(proj={comp['original_projection']:+.1f}) "
-            f"-> {comp['suffix_status']} "
-            f"(proj={comp['suffix_projection']:+.1f})"
+            f"    {marker} P{idx+1}: forced={comp['suffix_forced_status']} "
+            f"(proj={comp['suffix_forced_projection']:+.1f}) "
+            f"| gen={comp['suffix_status']} | gap={comp['loss_behavior_gap']}"
         )
     print("=" * 60)
 

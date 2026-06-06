@@ -93,6 +93,17 @@ class GCGOptimizer:
             suffix_ids = current_suffix_ids
         return torch.cat([prefix_ids, suffix_ids.to(prefix_ids.device), post_suffix_ids], dim=0).unsqueeze(0)
 
+    def build_forced_target_input_ids(self, prompt: str, suffix_ids: torch.Tensor | None = None) -> torch.Tensor:
+        prefix_ids, current_suffix_ids, post_suffix_ids, target_ids = self.build_input(prompt)
+        if suffix_ids is None:
+            suffix_ids = current_suffix_ids
+        return torch.cat([
+            prefix_ids,
+            suffix_ids.to(prefix_ids.device),
+            post_suffix_ids,
+            target_ids,
+        ], dim=0).unsqueeze(0)
+
     def step(self, prompt: str) -> dict:
         """
         Executes a single GCG iteration with multi-layer gradient computation.
@@ -191,7 +202,27 @@ class GCGOptimizer:
             "suffix": self.decode_suffix()
         }
 
-    def classify_by_activation_ids(self, input_ids: torch.Tensor) -> tuple[bool, float, str]:
+    def classify_activation_vector(self, act_vec: torch.Tensor) -> tuple[bool, float, str, dict]:
+        if self.activation_classifier is not None:
+            decision = self.activation_classifier.classify_activation(act_vec)
+            return (
+                decision.status == "Compliance",
+                decision.projection,
+                decision.status,
+                decision.to_dict(),
+            )
+
+        best_dir = self.direction_vecs[self.best_layer]
+        proj = torch.dot(act_vec.detach().float().cpu(), best_dir.float().cpu()).item()
+        status = "Compliance" if proj > 0 else "Refusal"
+        return status == "Compliance", proj, status, {
+            "status": status,
+            "projection": float(proj),
+            "threshold": 0.0,
+            "margin": float(proj),
+        }
+
+    def classify_by_activation_ids(self, input_ids: torch.Tensor, position: int = -1) -> tuple[bool, float, str, dict]:
         """
         Language-agnostic classification using activation projection.
         
@@ -201,65 +232,139 @@ class GCGOptimizer:
         input_ids = input_ids.to(self.raw_model.device)
         attention_mask = torch.ones_like(input_ids)
         
-        self.model.store.clear()
         with torch.no_grad():
-            self.model.forward(
+            outputs = self.raw_model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                output_hidden_states=True,
             )
-        
-        act = self.model.store.get(self.best_layer)
-        if act is None:
-            return False, -999.0
-        
-        if act.dim() == 3:
-            act_vec = act[0, -1, :].float()
-        else:
-            act_vec = act[-1, :].float()
-        
-        if self.activation_classifier is not None:
-            decision = self.activation_classifier.classify_activation(act_vec)
-            return decision.status == "Compliance", decision.projection, decision.status
 
-        best_dir = self.direction_vecs[self.best_layer]
-        proj = torch.dot(act_vec, best_dir.float().cpu()).item()
-        status = "Compliance" if proj > 0 else "Refusal"
-        return status == "Compliance", proj, status
+        hidden_idx = self.best_layer + 1
+        if outputs.hidden_states is None or hidden_idx >= len(outputs.hidden_states):
+            return False, -999.0, "Unknown", {
+                "status": "Unknown",
+                "projection": -999.0,
+                "threshold": 0.0,
+                "margin": -999.0,
+            }
 
-    def classify_by_activation(self, prompt_text: str) -> tuple[bool, float, str]:
+        act_vec = outputs.hidden_states[hidden_idx][0, position, :].float()
+        return self.classify_activation_vector(act_vec)
+
+    def classify_by_activation(self, prompt_text: str) -> tuple[bool, float, str, dict]:
         formatted = self.model.format_chat(prompt_text, assistant_prefix=None)
         inputs = self.model.tokenize(formatted)
         return self.classify_by_activation_ids(inputs["input_ids"])
+
+    def measure_forced_target(self, prompt: str) -> dict:
+        input_ids = self.build_forced_target_input_ids(prompt)
+        is_compliance, proj_val, status, decision = self.classify_by_activation_ids(input_ids, position=-1)
+        return {
+            "status": status,
+            "is_compliance": is_compliance,
+            "projection": proj_val,
+            "decision": decision,
+        }
+
+    def generate_response(self, prompt: str, max_new_tokens: int = 40) -> tuple[str, torch.Tensor]:
+        suffix_str = self.decode_suffix()
+        full_user_content = prompt if not suffix_str.strip() else prompt + " " + suffix_str
+        formatted_prompt = self.model.format_chat(full_user_content, assistant_prefix=None)
+        inputs = self.model.tokenize(formatted_prompt)
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                max_new_tokens=max_new_tokens,
+            )
+
+        input_len = inputs["input_ids"].shape[1]
+        response = self.model.decode(outputs[0, input_len:]).strip()
+        return response, inputs["input_ids"]
+
+    def track_generation_trajectory(
+        self,
+        prompt: str,
+        checkpoints: tuple[int, ...] = (1, 3, 5, 10),
+        max_new_tokens: int = 40,
+    ) -> dict:
+        suffix_str = self.decode_suffix()
+        full_user_content = prompt if not suffix_str.strip() else prompt + " " + suffix_str
+        formatted_prompt = self.model.format_chat(full_user_content, assistant_prefix=None)
+        inputs = self.model.tokenize(formatted_prompt)
+
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
+        generated_tokens = []
+        checkpoint_set = set(checkpoints)
+        trajectory = []
+
+        for _ in range(max_new_tokens + 1):
+            with torch.no_grad():
+                outputs = self.raw_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                )
+
+            generated_count = len(generated_tokens)
+            if generated_count in checkpoint_set:
+                hidden_state = outputs.hidden_states[self.best_layer + 1][0, -1, :].float()
+                is_compliance, proj_val, status, decision = self.classify_activation_vector(hidden_state)
+                trajectory.append({
+                    "step": generated_count,
+                    "status": status,
+                    "is_compliance": is_compliance,
+                    "projection": proj_val,
+                    "decision": decision,
+                    "token": self.model.decode(torch.tensor([generated_tokens[-1]], device=input_ids.device)).strip()
+                    if generated_tokens else "",
+                    "text_so_far": self.model.decode(
+                        torch.tensor(generated_tokens, device=input_ids.device),
+                    ).strip(),
+                })
+
+            if generated_count >= max_new_tokens:
+                break
+
+            next_token_logits = outputs.logits[0, -1, :]
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            token_val = next_token.item()
+            if token_val == self.tokenizer.eos_token_id:
+                break
+
+            generated_tokens.append(token_val)
+            input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=-1)
+            attention_mask = torch.cat([
+                attention_mask,
+                torch.ones((1, 1), device=attention_mask.device, dtype=attention_mask.dtype),
+            ], dim=-1)
+
+        response = self.model.decode(
+            torch.tensor(generated_tokens, device=input_ids.device),
+        ).strip() if generated_tokens else ""
+        generated_any_compliance = any(item["is_compliance"] for item in trajectory)
+        return {
+            "trajectory": trajectory,
+            "response": response,
+            "generated_any_compliance": generated_any_compliance,
+        }
 
     def check_success(self, prompt: str) -> tuple[bool, str]:
         """
         Checks jailbreak success using activation projection (language-agnostic).
         """
-        id_input_ids = self.build_generation_input_ids(prompt)
+        forced = self.measure_forced_target(prompt)
+        generated = self.track_generation_trajectory(prompt, max_new_tokens=40)
 
-        # Activation-based classification is diagnostic; response status is the
-        # early-stop criterion.
-        is_compliance, proj_val, activation_status = self.classify_by_activation_ids(id_input_ids)
+        proj_str = f"proj={forced['projection']:+.1f}"
+        print(
+            f"    [ForcedTarget] {forced['status'].upper()} ({proj_str}) "
+            f"| [GeneratedAny] {generated['generated_any_compliance']}"
+        )
 
-        suffix_str = self.decode_suffix()
-        full_user_content = prompt if not suffix_str.strip() else prompt + " " + suffix_str
-        formatted_prompt = self.model.format_chat(full_user_content, assistant_prefix=None)
-        inputs = self.model.tokenize(formatted_prompt)
-        
-        with torch.no_grad():
-            outputs = self.model.generate(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                max_new_tokens=40
-            )
-            
-        input_len = inputs["input_ids"].shape[1]
-        response = self.model.decode(outputs[0, input_len:]).strip()
-        
-        proj_str = f"proj={proj_val:+.1f}"
-        print(f"    [ActivationRef] {activation_status.upper()} ({proj_str})")
-        
-        return is_compliance, response
+        return forced["is_compliance"], generated["response"], forced, generated
 
     def optimize(self, prompt: str, max_steps=500, check_interval=25) -> dict:
         """
@@ -291,7 +396,7 @@ class GCGOptimizer:
                 )
                 
             if step_idx % check_interval == 0:
-                success, response = self.check_success(prompt)
+                success, response, forced, generated = self.check_success(prompt)
                 resp_safe = response.replace(chr(10), ' ')[:50].encode('ascii', errors='replace').decode('ascii')
                 print(f"  [Check] Success: {success} | Response snippet: {resp_safe}...")
                 if success:
@@ -304,11 +409,14 @@ class GCGOptimizer:
                         "losses": losses,
                         "target_losses": target_losses,
                         "activation_losses": activation_losses,
+                        "forced_target": forced,
+                        "generation_trajectory": generated,
+                        "loss_behavior_gap": success and not generated["generated_any_compliance"],
                     }
 
                     
         # Final check
-        success, response = self.check_success(prompt)
+        success, response, forced, generated = self.check_success(prompt)
         return {
             "success": success,
             "steps": max_steps,
@@ -317,4 +425,7 @@ class GCGOptimizer:
             "losses": losses,
             "target_losses": target_losses,
             "activation_losses": activation_losses,
+            "forced_target": forced,
+            "generation_trajectory": generated,
+            "loss_behavior_gap": success and not generated["generated_any_compliance"],
         }

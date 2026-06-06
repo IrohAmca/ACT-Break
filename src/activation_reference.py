@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -12,6 +13,9 @@ class ActivationDecision:
     refusal_mean: float
     compliance_mean: float
     margin: float
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 class ActivationReferenceClassifier:

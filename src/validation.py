@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+from src.activation_measurements import track_generation_trajectory_text
 
 class MultiStageValidator:
     """
@@ -69,6 +70,7 @@ class MultiStageValidator:
         N = len(prompts)
         transfer_matrix = np.zeros((N, N), dtype=np.int32)
         response_matrix = [[None for _ in range(N)] for _ in range(N)]
+        trajectory_matrix = [[None for _ in range(N)] for _ in range(N)]
 
         print(f"[*] Starting cross-validation of {N} prompts x {N} suffixes ({N*N} runs)...")
         print("    (Using activation projection for classification)")
@@ -78,30 +80,23 @@ class MultiStageValidator:
             print(f"[*] Testing Prompt {p_idx+1}: {prompt_safe[:50]}...")
             
             for s_idx, suffix in enumerate(suffixes):
-                full_user_content = prompt if not suffix.strip() else prompt + " " + suffix
-                
-                # Activation-based classification
-                is_compliance, proj_val = self.classify_by_activation(full_user_content)
-                
-                # Generate response for logging
-                formatted_prompt = self.model.format_chat(full_user_content, assistant_prefix=None)
-                inputs = self.model.tokenize(formatted_prompt)
-                
-                with torch.no_grad():
-                    outputs = self.model.generate(
-                        input_ids=inputs["input_ids"],
-                        attention_mask=inputs["attention_mask"],
-                        max_new_tokens=max_new_tokens
-                    )
-                
-                input_len = inputs["input_ids"].shape[1]
-                response = self.model.decode(outputs[0, input_len:]).strip()
+                generation = track_generation_trajectory_text(
+                    model=self.model,
+                    prompt=prompt,
+                    suffix=suffix,
+                    direction_vec=self.direction_vec,
+                    layer_idx=self.layer_idx,
+                    activation_classifier=self.activation_classifier,
+                    max_new_tokens=max_new_tokens,
+                )
+                response = generation["response"]
                 response_matrix[p_idx][s_idx] = response
+                trajectory_matrix[p_idx][s_idx] = generation
                 
-                success = 1 if is_compliance else 0
+                success = 1 if generation["generated_any_compliance"] else 0
                 transfer_matrix[p_idx, s_idx] = success
                 
-        return transfer_matrix, response_matrix
+        return transfer_matrix, response_matrix, trajectory_matrix
 
     def calculate_perplexity(self, prompt, suffix):
         """

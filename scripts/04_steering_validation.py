@@ -9,50 +9,8 @@ import config
 from src.model_loader import HookedModel
 from src.activation_steering import ActivationSteerer
 from src.activation_collector import load_prompts
+from src.activation_measurements import track_generation_trajectory_text
 from src.activation_reference import ActivationReferenceClassifier
-
-
-def classify_by_activation(model, prompt_text, direction_vec, layer_idx, activation_classifier=None):
-    """
-    Language-agnostic classification via activation projection.
-    Forward pass on formatted prompt -> extract hidden state -> dot(act, V_jailbreak).
-    Positive = compliance, negative = refusal.
-    """
-    formatted = model.format_chat(prompt_text, assistant_prefix=None)
-    inputs = model.tokenize(formatted)
-
-    with torch.no_grad():
-        outputs = model.model(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs.get("attention_mask"),
-            output_hidden_states=True,
-        )
-
-    hidden_idx = layer_idx + 1
-    if outputs.hidden_states is None or hidden_idx >= len(outputs.hidden_states):
-        return "Unknown", -999.0
-
-    act_vec = outputs.hidden_states[hidden_idx][0, -1, :].float()
-
-    proj = torch.dot(act_vec.cpu(), direction_vec.float().cpu()).item()
-    if activation_classifier is not None:
-        status = activation_classifier.classify_projection(proj).status
-    else:
-        status = "Compliance" if proj > 0 else "Refusal"
-    return status, proj
-
-
-def generate_without_hook_management(model, prompt_text, max_new_tokens=40):
-    formatted_prompt = model.format_chat(prompt_text, assistant_prefix=None)
-    inputs = model.tokenize(formatted_prompt)
-    with torch.no_grad():
-        outputs = model.generate(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            max_new_tokens=max_new_tokens,
-        )
-    input_len = inputs["input_ids"].shape[1]
-    return model.decode(outputs[0, input_len:]).strip()
 
 def main():
     print("=" * 60)
@@ -81,7 +39,7 @@ def main():
         direction_vecs = {best_layer: direction_data["direction"]}
         layer_indices = [best_layer]
     else:
-        print(f"[!] No steering vectors found. Run Step 3 first.")
+        print("[!] No steering vectors found. Run Step 3 first.")
         sys.exit(1)
 
     best_direction = direction_vecs[best_layer]
@@ -132,13 +90,24 @@ def main():
         for alpha in alphas:
             steerer.register_hooks(alpha)
             try:
-                # Activation-based classification while steering hooks are active.
-                status, proj_val = classify_by_activation(
-                    model, prompt, best_direction, best_layer, activation_classifier
+                generation = track_generation_trajectory_text(
+                    model=model,
+                    prompt=prompt,
+                    suffix="",
+                    direction_vec=best_direction,
+                    layer_idx=best_layer,
+                    activation_classifier=activation_classifier,
+                    max_new_tokens=40,
                 )
-                response = generate_without_hook_management(model, prompt, max_new_tokens=40)
             finally:
                 steerer.remove_hooks()
+
+            response = generation["response"]
+            status = "Compliance" if generation["generated_any_compliance"] else "Refusal"
+            proj_val = (
+                generation["trajectory"][0]["projection"]
+                if generation["trajectory"] else -999.0
+            )
             
             snippet = response.replace('\n', ' ').strip()[:50].encode('ascii', errors='replace').decode('ascii')
             print(
@@ -150,7 +119,8 @@ def main():
             prompt_results["sweep"][str(alpha)] = {
                 "response": response,
                 "status": status,
-                "projection": proj_val
+                "projection": proj_val,
+                "generation_trajectory": generation,
             }
             
             if status == "Compliance":

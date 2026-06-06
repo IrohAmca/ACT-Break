@@ -89,7 +89,11 @@ def main():
     print("Stage 1: Evaluating Suffix Transferability Matrix...")
     print("-" * 50)
     
-    transfer_matrix, response_matrix = validator.evaluate_transferability(prompts, suffixes, max_new_tokens=40)
+    transfer_matrix, response_matrix, trajectory_matrix = validator.evaluate_transferability(
+        prompts,
+        suffixes,
+        max_new_tokens=40,
+    )
     
     # Calculate transferability statistics
     # Suffix transfer rate: average success rate of suffix j on all OTHER prompts
@@ -195,7 +199,13 @@ def main():
     plt.figure(figsize=(10, 5))
     plt.plot(orig_projs, label="Original Prompt (Refusal)", color="red", marker="o", linewidth=2)
     plt.plot(jail_projs, label="Prompt + Suffix (Jailbreak)", color="blue", marker="x", linewidth=2)
-    plt.axhline(y=0.0, color="gray", linestyle="--", alpha=0.7, label="Neutral Threshold")
+    plt.axhline(
+        y=activation_classifier.threshold,
+        color="gray",
+        linestyle="--",
+        alpha=0.7,
+        label="Stage 1 Threshold",
+    )
     plt.title(f"Logit Lens Projection Trajectory (L{layer_idx}) - Prompt {target_idx+1}")
     plt.xlabel("Generated Token Index")
     plt.ylabel("Projection score onto V_jailbreak")
@@ -235,7 +245,8 @@ def main():
         "prompt_vuln_rates": prompt_vuln_rates,
         "diagonal_ppls": diagonal_ppls,
         "diagonal_relevances": diagonal_relevances,
-        "transfer_matrix": transfer_matrix.tolist()
+        "transfer_matrix": transfer_matrix.tolist(),
+        "trajectory_matrix": trajectory_matrix,
     }
     
     results_json_path = config.VALIDATION_DIR / "validation_results.json"
