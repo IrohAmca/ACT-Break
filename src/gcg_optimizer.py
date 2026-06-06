@@ -53,7 +53,7 @@ class GCGOptimizer:
             return self.tokenizer.decode(self.suffix_ids, skip_special_tokens=True)
 
     def _split_formatted_user_slot(self, prompt: str) -> tuple[str, str]:
-        sentinel = " <<ACT_BREAK_SUFFIX_SLOT>> "
+        sentinel = "ACT_BREAK_SUFFIX_SLOT"
         if sentinel in prompt:
             raise ValueError("Prompt contains reserved ACT-Break suffix sentinel.")
 
