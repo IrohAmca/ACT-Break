@@ -136,21 +136,13 @@ The pipeline was extensively evaluated against Google's **Gemma-3-1b-it** model 
 
 ## Google Colab Quick Start
 
-Run the entire ACT-Break pipeline on Google Colab with a single command:
+You can run the entire ACT-Break pipeline on Google Colab using our interactive Jupyter Notebook:
 
-1. Open a new Colab notebook and select a GPU runtime (T4 for free tier, A100 for Pro).
-2. Run the following in a cell:
+1. Upload the [ACT_Break_Colab.ipynb](ACT_Break_Colab.ipynb) notebook to your Google Colab instance.
+2. Select a GPU runtime (T4 for free tier, or L4/A100 for Colab Pro users to achieve high optimization speeds).
+3. Run the cells sequentially to clone the repository, install the `uv` environment, execute each step of the pipeline, and back up the results to Google Drive.
 
-```bash
-!git clone https://github.com/IrohAmca/ACT-Break.git
-%cd ACT-Break
-!python colab_runner.py
-```
-
-The script will automatically:
-- Install all dependencies via `uv`
-- Run the full 6-step pipeline
-- Upload results to Google Drive at `My Drive/ACT-Break-Results/`
+The notebook will automatically mount Google Drive and upload all generated plots, validation reports, and optimized suffixes to `My Drive/ACT-Break-Results/`.
 
 ---
 
@@ -159,7 +151,8 @@ The script will automatically:
 ```text
 ACT-Break/
 |-- config.py                       # Central configuration (hyperparameters, paths)
-|-- colab_runner.py                 # Google Colab single-command pipeline runner
+|-- ACT_Break_Colab.ipynb           # Jupyter Notebook for Google Colab pipeline execution
+|-- colab_runner.py                 # Command-line helper script for Google Colab execution
 |-- pyproject.toml                  # UV project configuration and dependencies
 |-- uv.lock                         # Lockfile for reproducible environment
 |-- data/
