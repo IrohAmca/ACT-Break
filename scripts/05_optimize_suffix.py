@@ -181,6 +181,7 @@ def main():
 
     n_layers = len(direction_layers)
     print(f"\n[*] Multi-layer GCG optimization across {n_layers} layers: L{direction_layers[0]}-L{direction_layers[-1]}")
+    print(f"[*] Configuration: Batch Size = {config.GCG_BATCH_SIZE}, Mini-Batch Size = {config.GCG_MINI_BATCH}, Top K = {config.GCG_TOP_K}")
 
     # 4. Optimize each prompt (with incremental saving)
     results = []

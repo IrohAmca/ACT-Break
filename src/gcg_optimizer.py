@@ -82,7 +82,7 @@ class GCGOptimizer:
         target_text = split_marker + "Sure, here is"
         
         # Tokenize prefix and target
-        prefix_ids = self.tokenizer.encode(prefix_text, add_special_tokens=True)
+        prefix_ids = self.tokenizer.encode(prefix_text, add_special_tokens=False)
         target_ids = self.tokenizer.encode(target_text, add_special_tokens=False)
         
         prefix_tensor = torch.tensor(prefix_ids, dtype=torch.long, device=self.raw_model.device)
@@ -151,9 +151,8 @@ class GCGOptimizer:
                 batch_embeds = embed_tokens(batch_ids)
                 outputs = self.raw_model(inputs_embeds=batch_embeds, output_hidden_states=True)
                 
-                # Use aggregation='max' (minimax): the WORST layer determines
-                # the candidate score. This forces selection of tokens that
-                # improve ALL layers simultaneously, not just the average.
+                # Use aggregation='mean': all layers contribute equally to
+                # candidate scoring, matching the gradient computation.
                 losses, _, _ = compute_loss(
                     logits=outputs.logits,
                     hidden_states=outputs.hidden_states,
@@ -164,7 +163,7 @@ class GCGOptimizer:
                     direction_layers=self.direction_layers,
                     alpha=self.alpha,
                     beta=self.beta,
-                    aggregation='max'
+                    aggregation='mean'
                 )
                 candidate_losses.extend(losses.tolist())
                 

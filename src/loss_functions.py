@@ -46,21 +46,25 @@ def compute_loss(logits, hidden_states, input_ids, suffix_slice, target_slice,
     loss_target = loss_target.view(batch_size, target_len).mean(dim=1)
     
     # 2. Multi-Layer Activation Loss
-    # For each target layer, compute the negative projection of suffix activations
-    # onto the layer's direction vector.
+    # For each target layer, compute the negative projection of the LAST TOKEN
+    # activation onto the layer's direction vector.
+    # The last token (just before target/generation) is where the model makes its
+    # refusal/compliance decision — matching how direction vectors were extracted.
+    last_token_pos = target_slice.start - 1  # position just before generation starts
+    
     layer_losses = []
     for layer_idx in direction_layers:
         # Output of layers[idx] is hidden_states[idx + 1]
         layer_output = hidden_states[layer_idx + 1]  # [batch_size, seq_len, hidden_dim]
-        suffix_acts = layer_output[:, suffix_slice, :]  # [batch_size, suffix_len, hidden_dim]
+        last_token_acts = layer_output[:, last_token_pos, :]  # [batch_size, hidden_dim]
         
-        d_vec = direction_vecs[layer_idx].to(suffix_acts.device).to(suffix_acts.dtype)
+        d_vec = direction_vecs[layer_idx].to(last_token_acts.device).to(last_token_acts.dtype)
         
-        # Dot product per token: [batch_size, suffix_len]
-        projections = torch.einsum("bsd,d->bs", suffix_acts, d_vec)
+        # Dot product: [batch_size]
+        projections = torch.einsum("bd,d->b", last_token_acts, d_vec)
         
         # Negative projection (we want to maximize projection = minimize negative)
-        layer_losses.append(-projections.mean(dim=1))  # [batch_size]
+        layer_losses.append(-projections)  # [batch_size]
     
     # Aggregate across layers: [num_layers, batch_size] -> [batch_size]
     stacked_layer_losses = torch.stack(layer_losses)  # [num_layers, batch_size]
