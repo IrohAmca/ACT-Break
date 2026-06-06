@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import config
 from src.model_loader import HookedModel
 from src.activation_collector import load_prompts
+from src.activation_reference import ActivationReferenceClassifier
 from src.gcg_optimizer import GCGOptimizer
 
 
@@ -33,7 +34,7 @@ def save_incremental(results: list, output_dir: Path):
         }, f, indent=2, ensure_ascii=False)
 
 
-def classify_by_activation(model, prompt_text, direction_vec, layer_idx):
+def classify_by_activation(model, prompt_text, direction_vec, layer_idx, activation_classifier=None):
     """
     Language-agnostic classification via activation projection.
     Forward pass on formatted prompt -> extract L_best hidden state -> dot(act, V_jailbreak).
@@ -59,11 +60,14 @@ def classify_by_activation(model, prompt_text, direction_vec, layer_idx):
         act_vec = act[-1, :].float()
 
     proj = torch.dot(act_vec, direction_vec.float().cpu()).item()
-    status = "Compliance" if proj > 0 else "Refusal"
+    if activation_classifier is not None:
+        status = activation_classifier.classify_projection(proj).status
+    else:
+        status = "Compliance" if proj > 0 else "Refusal"
     return status, proj
 
 
-def run_comparison_test(model, results: list, direction_vec, layer_idx):
+def run_comparison_test(model, results: list, direction_vec, layer_idx, activation_classifier):
     """
     Final comparison: for each prompt, generate a response WITH and WITHOUT
     the discovered suffix, side by side.
@@ -87,7 +91,7 @@ def run_comparison_test(model, results: list, direction_vec, layer_idx):
 
         # 1. Classify and generate WITHOUT suffix
         orig_status, orig_proj = classify_by_activation(
-            model, prompt, direction_vec, layer_idx
+            model, prompt, direction_vec, layer_idx, activation_classifier
         )
         formatted_original = model.format_chat(prompt, assistant_prefix=None)
         inputs_orig = model.tokenize(formatted_original)
@@ -103,7 +107,7 @@ def run_comparison_test(model, results: list, direction_vec, layer_idx):
         # 2. Classify and generate WITH suffix
         prompt_with_suffix = prompt + " " + suffix
         suf_status, suf_proj = classify_by_activation(
-            model, prompt_with_suffix, direction_vec, layer_idx
+            model, prompt_with_suffix, direction_vec, layer_idx, activation_classifier
         )
         formatted_suffix = model.format_chat(prompt_with_suffix, assistant_prefix=None)
         inputs_suf = model.tokenize(formatted_suffix)
@@ -118,8 +122,14 @@ def run_comparison_test(model, results: list, direction_vec, layer_idx):
 
         jailbreak_confirmed = (orig_status == "Refusal" and suf_status == "Compliance")
 
-        safe_print(f"  [Original]    ({orig_status}, proj={orig_proj:+.1f}) {response_original.replace(chr(10), ' ')[:70]}")
-        safe_print(f"  [With Suffix] ({suf_status}, proj={suf_proj:+.1f}) {response_with_suffix.replace(chr(10), ' ')[:70]}")
+        safe_print(
+            f"  [Original]    ({orig_status}, proj={orig_proj:+.1f}) "
+            f"{response_original.replace(chr(10), ' ')[:70]}"
+        )
+        safe_print(
+            f"  [With Suffix] ({suf_status}, proj={suf_proj:+.1f}) "
+            f"{response_with_suffix.replace(chr(10), ' ')[:70]}"
+        )
 
         comparisons.append({
             "prompt": prompt,
@@ -169,6 +179,17 @@ def main():
         sys.exit(1)
 
     best_direction = direction_vecs[best_layer]
+    activation_classifier = ActivationReferenceClassifier.from_path(
+        config.ACTIVATIONS_DIR / "activations.pt",
+        best_direction,
+        best_layer,
+    )
+    print(
+        "[+] Loaded Stage 1 activation reference: "
+        f"L{best_layer}, refusal_mean={activation_classifier.refusal_mean:+.1f}, "
+        f"compliance_mean={activation_classifier.compliance_mean:+.1f}, "
+        f"threshold={activation_classifier.threshold:+.1f}"
+    )
 
     # 3. Load model (hook ALL target layers for activation capture)
     model = HookedModel(
@@ -200,7 +221,9 @@ def main():
             batch_size=config.GCG_BATCH_SIZE,
             mini_batch_size=config.GCG_MINI_BATCH,
             alpha=config.LOSS_ALPHA,
-            beta=config.LOSS_BETA
+            beta=config.LOSS_BETA,
+            target_string=config.TARGET_STRING,
+            activation_classifier=activation_classifier
         )
 
         opt_res = optimizer.optimize(
@@ -215,7 +238,9 @@ def main():
             "steps": opt_res["steps"],
             "suffix": opt_res["suffix"],
             "response": opt_res["response"],
-            "losses": opt_res["losses"]
+            "losses": opt_res["losses"],
+            "target_losses": opt_res["target_losses"],
+            "activation_losses": opt_res["activation_losses"]
         }
         results.append(result_entry)
 
@@ -246,7 +271,7 @@ def main():
     print(f"\n[+] Saved loss curves to {plot_path}")
 
     # 6. Run comparison test (activation-based, language-agnostic)
-    comparisons = run_comparison_test(model, results, best_direction, best_layer)
+    comparisons = run_comparison_test(model, results, best_direction, best_layer, activation_classifier)
 
     # 7. Save final results with comparisons
     success_count = sum(1 for r in results if r["success"])
@@ -289,6 +314,12 @@ def main():
             f.write(f"  Suffix:            {res['suffix']}\n")
             f.write(f"  Original Status:   {comp['original_status']} (proj={comp['original_projection']:+.1f})\n")
             f.write(f"  Suffix Status:     {comp['suffix_status']} (proj={comp['suffix_projection']:+.1f})\n")
+            if res.get("losses"):
+                f.write(f"  Final Loss:        {res['losses'][-1]:+.4f}\n")
+            if res.get("target_losses"):
+                f.write(f"  Final CE Loss:     {res['target_losses'][-1]:+.4f}\n")
+            if res.get("activation_losses"):
+                f.write(f"  Final Act Loss:    {res['activation_losses'][-1]:+.4f}\n")
             f.write(f"  Jailbreak Confirmed: {comp['jailbreak_confirmed']}\n")
             f.write(f"  Original Response: {comp['original_response'].strip().replace(chr(10), ' ')[:100]}\n")
             f.write(f"  Suffix Response:   {comp['suffix_response'].strip().replace(chr(10), ' ')[:100]}\n\n")
@@ -306,7 +337,12 @@ def main():
     print("  Comparison Summary:")
     for idx, comp in enumerate(comparisons):
         marker = "[OK]" if comp["jailbreak_confirmed"] else "[--]"
-        print(f"    {marker} P{idx+1}: {comp['original_status']} (proj={comp['original_projection']:+.1f}) -> {comp['suffix_status']} (proj={comp['suffix_projection']:+.1f})")
+        print(
+            f"    {marker} P{idx+1}: {comp['original_status']} "
+            f"(proj={comp['original_projection']:+.1f}) "
+            f"-> {comp['suffix_status']} "
+            f"(proj={comp['suffix_projection']:+.1f})"
+        )
     print("=" * 60)
 
 

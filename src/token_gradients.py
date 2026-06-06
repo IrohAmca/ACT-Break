@@ -3,7 +3,8 @@ from src.loss_functions import compute_loss
 
 def compute_token_gradients(model, prefix_ids, suffix_ids, target_ids,
                             direction_vecs, direction_layers,
-                            alpha=1.0, beta=0.3):
+                            alpha=1.0, beta=0.3,
+                            post_suffix_ids=None):
     """
     Computes gradients of the multi-layer loss with respect to the one-hot
     representation of suffix tokens.
@@ -17,6 +18,7 @@ def compute_token_gradients(model, prefix_ids, suffix_ids, target_ids,
         direction_layers: list of int, target layer indices
         alpha: float, weight for target CE loss
         beta: float, weight for activation projection loss
+        post_suffix_ids: optional 1D Tensor between suffix and target
         
     Returns:
         Tensor of shape [suffix_len, vocab_size] representing the gradient of the loss
@@ -32,14 +34,20 @@ def compute_token_gradients(model, prefix_ids, suffix_ids, target_ids,
     prefix_ids = prefix_ids.to(device)
     suffix_ids = suffix_ids.to(device)
     target_ids = target_ids.to(device)
+    if post_suffix_ids is None:
+        post_suffix_ids = torch.empty(0, dtype=torch.long, device=device)
+    else:
+        post_suffix_ids = post_suffix_ids.to(device)
     
     prefix_len = len(prefix_ids)
     suffix_len = len(suffix_ids)
+    post_suffix_len = len(post_suffix_ids)
     target_len = len(target_ids)
     
     # Slice indices in the full sequence
     suffix_slice = slice(prefix_len, prefix_len + suffix_len)
-    target_slice = slice(prefix_len + suffix_len, prefix_len + suffix_len + target_len)
+    target_start = prefix_len + suffix_len + post_suffix_len
+    target_slice = slice(target_start, target_start + target_len)
     
     # Get embedding matrix
     embed_tokens = raw_model.model.embed_tokens
@@ -57,17 +65,19 @@ def compute_token_gradients(model, prefix_ids, suffix_ids, target_ids,
     # Prefix and target embeddings
     with torch.no_grad():
         prefix_embeds = embed_tokens(prefix_ids) # [prefix_len, hidden_dim]
+        post_suffix_embeds = embed_tokens(post_suffix_ids) # [post_suffix_len, hidden_dim]
         target_embeds = embed_tokens(target_ids) # [target_len, hidden_dim]
         
     # Concatenate embeddings: [1, seq_len, hidden_dim]
     full_embeds = torch.cat([
         prefix_embeds.unsqueeze(0),
         suffix_embeds.unsqueeze(0),
+        post_suffix_embeds.unsqueeze(0),
         target_embeds.unsqueeze(0)
     ], dim=1)
     
     # Full IDs (for loss target identification)
-    full_ids = torch.cat([prefix_ids, suffix_ids, target_ids], dim=0)
+    full_ids = torch.cat([prefix_ids, suffix_ids, post_suffix_ids, target_ids], dim=0)
     
     # Forward pass
     outputs = raw_model(inputs_embeds=full_embeds, output_hidden_states=True)

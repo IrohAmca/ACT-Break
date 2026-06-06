@@ -1,13 +1,13 @@
 import random
 import torch
-import torch.nn as nn
 from src.token_gradients import compute_token_gradients
 from src.loss_functions import compute_loss
 
 class GCGOptimizer:
     def __init__(self, hooked_model, direction_vecs, direction_layers, best_layer,
                  suffix_length=20, top_k=256, batch_size=64, mini_batch_size=16,
-                 alpha=1.0, beta=0.3):
+                 alpha=1.0, beta=0.3, target_string="Sure, here is",
+                 activation_classifier=None):
         """
         Multi-layer GCG optimizer.
 
@@ -31,6 +31,8 @@ class GCGOptimizer:
         self.mini_batch_size = mini_batch_size
         self.alpha = alpha
         self.beta = beta
+        self.target_string = target_string
+        self.activation_classifier = activation_classifier
         
         # Initialize suffix with '!' token repeated
         init_token_ids = self.tokenizer.encode("!", add_special_tokens=False)
@@ -41,60 +43,61 @@ class GCGOptimizer:
         self.suffix_ids = torch.tensor([init_id] * self.suffix_length, dtype=torch.long, device=self.raw_model.device)
         
     def decode_suffix(self) -> str:
-        return self.tokenizer.decode(self.suffix_ids, skip_special_tokens=True)
-        
-    def build_input(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Tokenizes the prefix and target to form clean lists of token IDs.
-        
-        Auto-detects the generation prompt marker from the chat template 
-        to work with both Qwen and Gemma models.
-        """
-        # 1. Get full template WITH generation prompt
-        base_text = self.tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
+        try:
+            return self.tokenizer.decode(
+                self.suffix_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+        except TypeError:
+            return self.tokenizer.decode(self.suffix_ids, skip_special_tokens=True)
+
+    def _split_formatted_user_slot(self, prompt: str) -> tuple[str, str]:
+        sentinel = " <<ACT_BREAK_SUFFIX_SLOT>> "
+        if sentinel in prompt:
+            raise ValueError("Prompt contains reserved ACT-Break suffix sentinel.")
+
+        formatted = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt + " " + sentinel}],
             tokenize=False,
-            add_generation_prompt=True
+            add_generation_prompt=True,
         )
+        if sentinel not in formatted:
+            raise ValueError("Could not locate suffix sentinel in chat template output.")
+
+        prefix_text, post_suffix_text = formatted.split(sentinel, 1)
+        return prefix_text, post_suffix_text
         
-        # 2. Get template WITHOUT generation prompt to find where generation starts
-        no_gen_text = self.tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            tokenize=False,
-            add_generation_prompt=False
-        )
-        
-        # 3. The generation prompt marker is the difference between the two
-        if base_text.startswith(no_gen_text):
-            split_marker = base_text[len(no_gen_text):]
-            prefix_text = no_gen_text
-        else:
-            for marker in ["<end_of_turn>\n<start_of_turn>model\n",
-                           "<|im_end|>\n<|im_start|>assistant\n"]:
-                if marker in base_text:
-                    prefix_text = base_text.rsplit(marker, 1)[0]
-                    split_marker = marker
-                    break
-            else:
-                prefix_text = base_text
-                split_marker = ""
-            
-        target_text = split_marker + "Sure, here is"
-        
-        # Tokenize prefix and target
+    def build_input(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Tokenizes the prompt into prefix/suffix/post-suffix/target segments.
+
+        The suffix slot is inside the user message, matching the final
+        suffix-injected evaluation prompt.
+        """
+        prefix_text, post_suffix_text = self._split_formatted_user_slot(prompt)
+
         prefix_ids = self.tokenizer.encode(prefix_text, add_special_tokens=False)
-        target_ids = self.tokenizer.encode(target_text, add_special_tokens=False)
+        post_suffix_ids = self.tokenizer.encode(post_suffix_text, add_special_tokens=False)
+        target_ids = self.tokenizer.encode(self.target_string, add_special_tokens=False)
         
         prefix_tensor = torch.tensor(prefix_ids, dtype=torch.long, device=self.raw_model.device)
+        post_suffix_tensor = torch.tensor(post_suffix_ids, dtype=torch.long, device=self.raw_model.device)
         target_tensor = torch.tensor(target_ids, dtype=torch.long, device=self.raw_model.device)
         
-        return prefix_tensor, self.suffix_ids, target_tensor
+        return prefix_tensor, self.suffix_ids, post_suffix_tensor, target_tensor
+
+    def build_generation_input_ids(self, prompt: str, suffix_ids: torch.Tensor | None = None) -> torch.Tensor:
+        prefix_ids, current_suffix_ids, post_suffix_ids, _ = self.build_input(prompt)
+        if suffix_ids is None:
+            suffix_ids = current_suffix_ids
+        return torch.cat([prefix_ids, suffix_ids.to(prefix_ids.device), post_suffix_ids], dim=0).unsqueeze(0)
 
     def step(self, prompt: str) -> dict:
         """
         Executes a single GCG iteration with multi-layer gradient computation.
         """
-        prefix_ids, suffix_ids, target_ids = self.build_input(prompt)
+        prefix_ids, suffix_ids, post_suffix_ids, target_ids = self.build_input(prompt)
         
         # 1. Compute gradients (now using all target layers)
         grad = compute_token_gradients(
@@ -105,7 +108,8 @@ class GCGOptimizer:
             direction_vecs=self.direction_vecs,
             direction_layers=self.direction_layers,
             alpha=self.alpha,
-            beta=self.beta
+            beta=self.beta,
+            post_suffix_ids=post_suffix_ids
         )
         
         # 2. Exclude special tokens from candidates
@@ -132,18 +136,22 @@ class GCGOptimizer:
         # 5. Evaluate candidates in VRAM-efficient mini-batches
         embed_tokens = self.raw_model.model.embed_tokens
         prefix_len = len(prefix_ids)
+        post_suffix_len = len(post_suffix_ids)
         target_len = len(target_ids)
         
         suffix_slice = slice(prefix_len, prefix_len + self.suffix_length)
-        target_slice = slice(prefix_len + self.suffix_length, prefix_len + self.suffix_length + target_len)
+        target_start = prefix_len + self.suffix_length + post_suffix_len
+        target_slice = slice(target_start, target_start + target_len)
         
         candidate_losses = []
+        candidate_target_losses = []
+        candidate_activation_losses = []
         
         for i in range(0, len(candidates), self.mini_batch_size):
             mini_batch = candidates[i:i + self.mini_batch_size]
             
             batch_ids = torch.stack([
-                torch.cat([prefix_ids, cand, target_ids])
+                torch.cat([prefix_ids, cand, post_suffix_ids, target_ids])
                 for cand in mini_batch
             ])
             
@@ -153,7 +161,7 @@ class GCGOptimizer:
                 
                 # Use aggregation='mean': all layers contribute equally to
                 # candidate scoring, matching the gradient computation.
-                losses, _, _ = compute_loss(
+                losses, target_losses, activation_losses = compute_loss(
                     logits=outputs.logits,
                     hidden_states=outputs.hidden_states,
                     input_ids=batch_ids,
@@ -166,6 +174,8 @@ class GCGOptimizer:
                     aggregation='mean'
                 )
                 candidate_losses.extend(losses.tolist())
+                candidate_target_losses.extend(target_losses.tolist())
+                candidate_activation_losses.extend(activation_losses.tolist())
                 
             torch.cuda.empty_cache()
             
@@ -176,24 +186,26 @@ class GCGOptimizer:
         
         return {
             "loss": best_loss,
+            "target_loss": candidate_target_losses[best_idx],
+            "activation_loss": candidate_activation_losses[best_idx],
             "suffix": self.decode_suffix()
         }
 
-    def classify_by_activation(self, prompt_text: str) -> tuple[bool, float]:
+    def classify_by_activation_ids(self, input_ids: torch.Tensor) -> tuple[bool, float, str]:
         """
         Language-agnostic classification using activation projection.
         
         Uses the best_layer direction vector for classification.
         Positive projection = compliance, negative = refusal.
         """
-        formatted = self.model.format_chat(prompt_text, assistant_prefix=None)
-        inputs = self.model.tokenize(formatted)
+        input_ids = input_ids.to(self.raw_model.device)
+        attention_mask = torch.ones_like(input_ids)
         
         self.model.store.clear()
         with torch.no_grad():
             self.model.forward(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs.get("attention_mask"),
+                input_ids=input_ids,
+                attention_mask=attention_mask,
             )
         
         act = self.model.store.get(self.best_layer)
@@ -205,22 +217,32 @@ class GCGOptimizer:
         else:
             act_vec = act[-1, :].float()
         
+        if self.activation_classifier is not None:
+            decision = self.activation_classifier.classify_activation(act_vec)
+            return decision.status == "Compliance", decision.projection, decision.status
+
         best_dir = self.direction_vecs[self.best_layer]
         proj = torch.dot(act_vec, best_dir.float().cpu()).item()
-        is_compliance = proj > 0
-        return is_compliance, proj
+        status = "Compliance" if proj > 0 else "Refusal"
+        return status == "Compliance", proj, status
+
+    def classify_by_activation(self, prompt_text: str) -> tuple[bool, float, str]:
+        formatted = self.model.format_chat(prompt_text, assistant_prefix=None)
+        inputs = self.model.tokenize(formatted)
+        return self.classify_by_activation_ids(inputs["input_ids"])
 
     def check_success(self, prompt: str) -> tuple[bool, str]:
         """
         Checks jailbreak success using activation projection (language-agnostic).
         """
+        id_input_ids = self.build_generation_input_ids(prompt)
+
+        # Activation-based classification is diagnostic; response status is the
+        # early-stop criterion.
+        is_compliance, proj_val, activation_status = self.classify_by_activation_ids(id_input_ids)
+
         suffix_str = self.decode_suffix()
-        full_user_content = prompt + " " + suffix_str
-        
-        # Activation-based classification
-        is_compliance, proj_val = self.classify_by_activation(full_user_content)
-        
-        # Generate response for logging
+        full_user_content = prompt if not suffix_str.strip() else prompt + " " + suffix_str
         formatted_prompt = self.model.format_chat(full_user_content, assistant_prefix=None)
         inputs = self.model.tokenize(formatted_prompt)
         
@@ -235,8 +257,7 @@ class GCGOptimizer:
         response = self.model.decode(outputs[0, input_len:]).strip()
         
         proj_str = f"proj={proj_val:+.1f}"
-        safe_tag = "COMPLY" if is_compliance else "REFUSE"
-        print(f"    [Activation] {safe_tag} ({proj_str})")
+        print(f"    [ActivationRef] {activation_status.upper()} ({proj_str})")
         
         return is_compliance, response
 
@@ -250,16 +271,24 @@ class GCGOptimizer:
         print(f"    Multi-layer GCG across {n_layers} layers: L{self.direction_layers[0]}-L{self.direction_layers[-1]}")
         
         losses = []
-        best_suffix = self.decode_suffix()
+        target_losses = []
+        activation_losses = []
         
         for step_idx in range(1, max_steps + 1):
             step_res = self.step(prompt)
             loss_val = step_res["loss"]
             losses.append(loss_val)
+            target_losses.append(step_res["target_loss"])
+            activation_losses.append(step_res["activation_loss"])
             
             if step_idx % 10 == 0 or step_idx == 1:
                 suffix_safe = step_res['suffix'][:40].encode('ascii', errors='replace').decode('ascii')
-                print(f"  Step {step_idx:03d} | Loss: {loss_val:.4f} | Suffix: {suffix_safe}...")
+                print(
+                    f"  Step {step_idx:03d} | Loss: {loss_val:.4f} "
+                    f"| CE: {step_res['target_loss']:.4f} "
+                    f"| Act: {step_res['activation_loss']:.4f} "
+                    f"| Suffix: {suffix_safe}..."
+                )
                 
             if step_idx % check_interval == 0:
                 success, response = self.check_success(prompt)
@@ -272,7 +301,9 @@ class GCGOptimizer:
                         "steps": step_idx,
                         "suffix": self.decode_suffix(),
                         "response": response,
-                        "losses": losses
+                        "losses": losses,
+                        "target_losses": target_losses,
+                        "activation_losses": activation_losses,
                     }
 
                     
@@ -283,5 +314,7 @@ class GCGOptimizer:
             "steps": max_steps,
             "suffix": self.decode_suffix(),
             "response": response,
-            "losses": losses
+            "losses": losses,
+            "target_losses": target_losses,
+            "activation_losses": activation_losses,
         }

@@ -9,9 +9,10 @@ import config
 from src.model_loader import HookedModel
 from src.activation_steering import ActivationSteerer
 from src.activation_collector import load_prompts
+from src.activation_reference import ActivationReferenceClassifier
 
 
-def classify_by_activation(model, prompt_text, direction_vec, layer_idx):
+def classify_by_activation(model, prompt_text, direction_vec, layer_idx, activation_classifier=None):
     """
     Language-agnostic classification via activation projection.
     Forward pass on formatted prompt -> extract hidden state -> dot(act, V_jailbreak).
@@ -20,25 +21,38 @@ def classify_by_activation(model, prompt_text, direction_vec, layer_idx):
     formatted = model.format_chat(prompt_text, assistant_prefix=None)
     inputs = model.tokenize(formatted)
 
-    model.store.clear()
     with torch.no_grad():
-        model.forward(
+        outputs = model.model(
             input_ids=inputs["input_ids"],
             attention_mask=inputs.get("attention_mask"),
+            output_hidden_states=True,
         )
 
-    act = model.store.get(layer_idx)
-    if act is None:
+    hidden_idx = layer_idx + 1
+    if outputs.hidden_states is None or hidden_idx >= len(outputs.hidden_states):
         return "Unknown", -999.0
 
-    if act.dim() == 3:
-        act_vec = act[0, -1, :].float()
-    else:
-        act_vec = act[-1, :].float()
+    act_vec = outputs.hidden_states[hidden_idx][0, -1, :].float()
 
-    proj = torch.dot(act_vec, direction_vec.float().cpu()).item()
-    status = "Compliance" if proj > 0 else "Refusal"
+    proj = torch.dot(act_vec.cpu(), direction_vec.float().cpu()).item()
+    if activation_classifier is not None:
+        status = activation_classifier.classify_projection(proj).status
+    else:
+        status = "Compliance" if proj > 0 else "Refusal"
     return status, proj
+
+
+def generate_without_hook_management(model, prompt_text, max_new_tokens=40):
+    formatted_prompt = model.format_chat(prompt_text, assistant_prefix=None)
+    inputs = model.tokenize(formatted_prompt)
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            max_new_tokens=max_new_tokens,
+        )
+    input_len = inputs["input_ids"].shape[1]
+    return model.decode(outputs[0, input_len:]).strip()
 
 def main():
     print("=" * 60)
@@ -71,6 +85,17 @@ def main():
         sys.exit(1)
 
     best_direction = direction_vecs[best_layer]
+    activation_classifier = ActivationReferenceClassifier.from_path(
+        config.ACTIVATIONS_DIR / "activations.pt",
+        best_direction,
+        best_layer,
+    )
+    print(
+        "[+] Loaded Stage 1 activation reference: "
+        f"L{best_layer}, refusal_mean={activation_classifier.refusal_mean:+.1f}, "
+        f"compliance_mean={activation_classifier.compliance_mean:+.1f}, "
+        f"threshold={activation_classifier.threshold:+.1f}"
+    )
 
     # 3. Load model (hook all target layers for activation capture)
     model = HookedModel(
@@ -105,15 +130,21 @@ def main():
         prompt_results = {"prompt": prompt, "sweep": {}}
         
         for alpha in alphas:
-            response = steerer.steer_and_generate(prompt, alpha, max_new_tokens=40)
-            
-            # Activation-based classification using best layer
-            status, proj_val = classify_by_activation(
-                model, prompt, best_direction, best_layer
-            )
+            steerer.register_hooks(alpha)
+            try:
+                # Activation-based classification while steering hooks are active.
+                status, proj_val = classify_by_activation(
+                    model, prompt, best_direction, best_layer, activation_classifier
+                )
+                response = generate_without_hook_management(model, prompt, max_new_tokens=40)
+            finally:
+                steerer.remove_hooks()
             
             snippet = response.replace('\n', ' ').strip()[:50].encode('ascii', errors='replace').decode('ascii')
-            print(f"  alpha={alpha:>2.1f} | {status:<10} (proj={proj_val:+.1f}) | Response: {snippet}...")
+            print(
+                f"  alpha={alpha:>2.1f} | {status:<10} "
+                f"(proj={proj_val:+.1f}) | Response: {snippet}..."
+            )
 
             
             prompt_results["sweep"][str(alpha)] = {

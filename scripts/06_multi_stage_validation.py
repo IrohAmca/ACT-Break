@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import config
 from src.model_loader import HookedModel
+from src.activation_reference import ActivationReferenceClassifier
 from src.validation import MultiStageValidator
 
 def safe_str(s):
@@ -55,6 +56,18 @@ def main():
     layer_idx = direction_data["layer"]
     print(f"[+] Loaded direction vector for layer L{layer_idx}")
 
+    activation_classifier = ActivationReferenceClassifier.from_path(
+        config.ACTIVATIONS_DIR / "activations.pt",
+        direction_vec,
+        layer_idx,
+    )
+    print(
+        "[+] Loaded Stage 1 activation reference: "
+        f"L{layer_idx}, refusal_mean={activation_classifier.refusal_mean:+.1f}, "
+        f"compliance_mean={activation_classifier.compliance_mean:+.1f}, "
+        f"threshold={activation_classifier.threshold:+.1f}"
+    )
+
     # 3. Load model
     model = HookedModel(
         model_name=config.MODEL_NAME,
@@ -67,7 +80,8 @@ def main():
         hooked_model=model,
         tokenizer=model.tokenizer,
         direction_vec=direction_vec,
-        layer_idx=layer_idx
+        layer_idx=layer_idx,
+        activation_classifier=activation_classifier
     )
 
     # === STAGE 1: Transferability Matrix ===
@@ -152,7 +166,7 @@ def main():
 
     # === STAGE 3: Logit Lens Projection Tracking ===
     print("\n" + "-" * 50)
-    print("Stage 3: Tracking Logit Lens (Layer L12 Projection)...")
+    print(f"Stage 3: Tracking Logit Lens (Layer L{layer_idx} Projection)...")
     print("-" * 50)
     
     # Pick the first prompt that is successfully jailbroken

@@ -46,17 +46,15 @@ def compute_loss(logits, hidden_states, input_ids, suffix_slice, target_slice,
     loss_target = loss_target.view(batch_size, target_len).mean(dim=1)
     
     # 2. Multi-Layer Activation Loss
-    # For each target layer, compute the negative projection of the LAST TOKEN
-    # activation onto the layer's direction vector.
-    # The last token (just before target/generation) is where the model makes its
-    # refusal/compliance decision — matching how direction vectors were extracted.
-    last_token_pos = target_slice.start - 1  # position just before generation starts
+    # Match the direction extraction position: the hidden state after the model
+    # has produced the response prefix, not the pre-generation prompt state.
+    activation_pos = target_slice.stop - 1
     
     layer_losses = []
     for layer_idx in direction_layers:
         # Output of layers[idx] is hidden_states[idx + 1]
         layer_output = hidden_states[layer_idx + 1]  # [batch_size, seq_len, hidden_dim]
-        last_token_acts = layer_output[:, last_token_pos, :]  # [batch_size, hidden_dim]
+        last_token_acts = layer_output[:, activation_pos, :]  # [batch_size, hidden_dim]
         
         d_vec = direction_vecs[layer_idx].to(last_token_acts.device).to(last_token_acts.dtype)
         
