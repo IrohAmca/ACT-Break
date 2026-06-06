@@ -2,18 +2,19 @@ import torch
 from src.loss_functions import compute_loss
 
 def compute_token_gradients(model, prefix_ids, suffix_ids, target_ids,
-                            direction_vec, direction_layer,
+                            direction_vecs, direction_layers,
                             alpha=1.0, beta=0.3):
     """
-    Computes gradients of the loss with respect to the one-hot representation of suffix tokens.
+    Computes gradients of the multi-layer loss with respect to the one-hot
+    representation of suffix tokens.
     
     Args:
         model: HookedModel or the raw AutoModelForCausalLM.
         prefix_ids: 1D Tensor of prefix token IDs
         suffix_ids: 1D Tensor of current suffix token IDs
         target_ids: 1D Tensor of target token IDs
-        direction_vec: Tensor of shape [hidden_dim]
-        direction_layer: int, layer to target
+        direction_vecs: dict mapping layer_idx -> direction Tensor [hidden_dim]
+        direction_layers: list of int, target layer indices
         alpha: float, weight for target CE loss
         beta: float, weight for activation projection loss
         
@@ -71,15 +72,15 @@ def compute_token_gradients(model, prefix_ids, suffix_ids, target_ids,
     # Forward pass
     outputs = raw_model(inputs_embeds=full_embeds, output_hidden_states=True)
     
-    # Compute combined loss
+    # Compute combined multi-layer loss
     loss, _, _ = compute_loss(
         logits=outputs.logits,
         hidden_states=outputs.hidden_states,
         input_ids=full_ids,
         suffix_slice=suffix_slice,
         target_slice=target_slice,
-        direction_vec=direction_vec,
-        direction_layer=direction_layer,
+        direction_vecs=direction_vecs,
+        direction_layers=direction_layers,
         alpha=alpha,
         beta=beta
     )

@@ -8,6 +8,7 @@ from src.activation_collector import load_activations
 from src.direction_extractor import (
     compare_directions,
     compute_projections,
+    extract_all_layer_directions,
     extract_direction_from_difference,
     extract_direction_from_probe,
     save_direction,
@@ -18,7 +19,7 @@ from src.probe_trainer import load_probes
 
 def main():
     print("=" * 60)
-    print("ACT-Break — Step 3: Direction Extraction & Validation")
+    print("ACT-Break -- Step 3: Direction Extraction & Validation")
     print("=" * 60)
 
     activations_data = load_activations(str(config.ACTIVATIONS_DIR / "activations.pt"))
@@ -44,8 +45,17 @@ def main():
     save_direction(dir_probe, str(config.OUTPUT_DIR / "direction_probe.pt"))
     save_direction(dir_diff, str(config.OUTPUT_DIR / "direction_diff.pt"))
 
+    # === Multi-Layer Direction Extraction ===
+    print("\n" + "-" * 50)
+    print("Extracting multi-layer direction vectors (L8-L14)...")
+    print("-" * 50)
+
+    multi_dir_data = extract_all_layer_directions(probe_results, config.TARGET_LAYERS)
+    save_direction(multi_dir_data, str(config.MULTI_LAYER_DIRECTIONS_PATH))
+
     print("\n" + "=" * 60)
-    print(f"[+] Step 3 complete. Direction cosine similarity: {cosine_sim:.4f}")
+    print(f"[+] Step 3 complete. Best layer cosine similarity: {cosine_sim:.4f}")
+    print(f"[+] Multi-layer directions saved: {len(config.TARGET_LAYERS)} layers")
     print("=" * 60)
 
 if __name__ == "__main__":

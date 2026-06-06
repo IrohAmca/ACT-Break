@@ -2,15 +2,15 @@
 
 **Activation-guided Contrastive Testing for Jailbreak Resistance**
 
-ACT-Break is a white-box analysis framework for studying jailbreak direction vectors in language model activation space, optimizing jailbreak suffixes using activation steering directions, and validating model alignment. It uses Qwen-2.5-0.5B-Instruct to isolate activation directions associated with refusal and compliance behavior, steering, and GCG (Greedy Coordinate Gradient) suffix optimization.
+ACT-Break is a white-box analysis framework for studying jailbreak direction vectors in language model activation space, optimizing jailbreak suffixes using activation steering directions, and validating model alignment robustness. It supports both **Qwen-2.5-0.5B-Instruct** (weak alignment benchmark) and **Gemma-3-1b-it** (highly robust state-of-the-art alignment).
 
-## Project Status
+## Project Status & Model Comparison
 
-| Module | Status | Description | Key Deliverables & Results |
+| Module | Target | Qwen-2.5-0.5B-Instruct (Weak Alignment) | Gemma-3-1b-it (Robust Alignment) |
 | --- | --- | --- | --- |
-| **1. Activation Compass** | **Completed** | Extracts refusal vs. compliance activation direction vector (`V_jailbreak`). | Probes trained on layers L12-L18 (100% accuracy, AUC 1.00). Selected L12 as the best layer. Cosine similarity between probe weight and mean-difference direction: **0.9962**. |
-| **2. Suffix Discovery Engine** | **Completed** | Optimizes adversarial suffixes using GCG guided by a combined loss (Target CE Loss + Activation Projection Loss). | GCG Optimization Success: **10/10 (100%)**. Confirmed Jailbreaks (true alignment bypass): **7/10 (70%)**. Converges in average ~50 steps. |
-| **3. Multi-stage Validation** | **Completed** | Evaluates transferability, perplexity filters, topic relevance, and defense resistance. | Average Suffix Transfer Rate: **57.8%**. Adversarial suffixes show **166x higher perplexity** than baseline. Logit Lens enables **step-1 detection** of jailbreaks during token generation. |
+| **1. Activation Compass** | Refusal vs. Compliance Direction Vector (`V_jailbreak`) | Probes trained on L12-L18 (100% accuracy, AUC 1.00). Selected L12. Cosine Similarity (Probe vs Diff-of-Means): **0.9962** (Single direction hypothesis holds). | Probes trained on L8-L14 (100% accuracy, AUC 1.00). Selected L8. Cosine Similarity: **0.3711** (Refusal resides in a multi-dimensional subspace, not a single direction). |
+| **2. Suffix Discovery Engine** | Adversarial Suffix Optimization via GCG + Activation Loss | GCG Success: **100% (10/10)**.<br>True Jailbreaks: **70%** (7/10).<br>Convergence: ~50 steps. | GCG Success: **0% (0/1)**.<br>True Jailbreaks: **0%**.<br>Optimization fails to jailbreak despite negative loss (Loss-Behavior Gap). Model shifts to Marathi but maintains refusal. |
+| **3. Multi-stage Validation** | Transferability, Perplexity, Logit Lens & Topic Relevance | Suffix Transfer Rate: **57.8%**.<br>Perplexity Filter: **166x increase** on jailbreak suffixes.<br>Logit Lens: Step-1 detection at L12. | *Evaluation skipped due to 0% GCG success rate.* Logit Lens and perplexity metrics showed extremely high safety robustness. |
 
 ---
 
@@ -83,27 +83,74 @@ All execution scripts are located under the `scripts/` directory and should be r
 
 ---
 
-## Results Summary
+## Results Summary (Qwen-2.5-0.5B-Instruct)
 
-### Module 1 Validation
+### Module 1 Validation (Qwen)
 * **Probe Accuracy**: 100.0% accuracy on validation splits for layers L12-L18.
 * **Separation**: Clear visual separation between compliance and refusal activations under PCA.
 * **Projections on L12**:
   - Compliance Activations: $+6.88 \pm 0.19$
   - Refusal Activations: $-6.79 \pm 0.20$
 
-### Module 2 Validation
+### Module 2 Validation (Qwen)
 * **Optimization Speed**: Converged rapidly. Several prompts reached the compliance target in just 25 steps; others took 50 steps.
 * **Jailbreak Results (10 prompts tested)**:
   - **70% True Jailbreak**: Prompts that refused originally but complied when the suffix was appended (e.g., firearm usage instructions, bomb-making guide, database hacking strategy).
   - **20% False Positive**: Prompts that the model naturally complied with even without suffixes (manipulation tutorial, dangerous behavior posts - the 0.5B model lacks strict safety alignment on these).
   - **10% Semantic Drift**: One prompt (bomb-making tutorial) succeeded GCG check but resulted in the model talking about "OSAS (Open Source Software Assembly)" instead of explosives.
 
-### Module 3 Validation
+### Module 3 Validation (Qwen)
 * **Transferability Matrix**: Diagonal (Self) Success: **100%**. Average Suffix Transfer Rate: **57.8%**. Prompt vulnerability to other suffixes: **57.8%**. Suffix 1 (exploit) is the most transferable with a **88.9% transfer success rate**.
 * **Perplexity Check**: Adversarial suffixes show **166x higher perplexity** (Mean PPL: 41,181.02) compared to baseline 'Sure, here is' compliance prefix (Mean PPL: 247.97). This provides an easy black-box filter defense.
 * **Logit Lens Tracking**: Successfully shows that intermediate hidden states on layer L12 jump to the positive V_jailbreak (compliance) region at step 1 during jailbroken generation, compared to remaining negative for original prompts.
 * **Topic Relevance**: Cosine similarity averages **0.5536** between prompt and response embeddings.
+
+---
+
+## Gemma-3-1b-it Security Findings
+
+The pipeline was extensively evaluated against Google's **Gemma-3-1b-it** model (1 Billion parameters, 26 layers) on a hardware-constrained environment (GTX 1650 4GB). In contrast to Qwen, **Gemma-3-1b-it demonstrated absolute resilience (100% defense rate) against both linear activation steering and GCG suffix attacks.**
+
+### 1. Multi-Dimensional Refusal Subspace (Module 1)
+* **Probe Accuracy**: 100.0% validation accuracy and 1.00 AUC across all evaluated middle-to-late layers (L8 to L14).
+* **Cosine Similarity (Probe vs. Diff-of-Means)**: **0.3711** (significantly lower than Qwen's 0.9962). 
+* **Security Inference**: This low cosine similarity invalidates the "Single Direction Hypothesis" (Arditi et al.) for Gemma-3. Refusal behavior does not lie on a single 1D vector but is distributed across a multi-dimensional subspace or complex manifold, making simple 1D steering vectors highly ineffective.
+
+### 2. Complete Resistance to Activation Steering (Module 2 - Phase A)
+* **Steering Success Rate**: **0% (0/135 trials)**.
+* **Setup**: Swept across 15 harmful prompts and 9 alpha levels (0 to 50) on layer L8.
+* **Findings**:
+  * Out of 135 runs, 134 resulted in direct refusals. The 1 single compliance was a false positive where the model provided standard child gun-safety guidelines (and behaved identically at alpha=0).
+  * Extremely large perturbations ($\alpha = 50$) did not alter a single token in the refusal responses.
+  * **Security Inference**: Applying steering hooks to a single layer (L8) is completely bypassed. The remaining 18 layers (L9-L25) absorb the perturbation and restore the safety alignment downstream.
+
+### 3. Suffix Optimization Fails via Loss-Behavior Gap (Module 2 - Phase B)
+* **GCG Success Rate**: **0%**.
+* **Findings**:
+  * For the exploit generation prompt, the combined GCG loss successfully decreased from **10.85 to -4.12** over 150 steps.
+  * Despite the mathematical minimization of the loss, the model **still refused to comply** (answering in Marathi: *"मला माफ करा, पण मी तुम्हाला..."*).
+  * **Security Inference (Loss-Behavior Gap)**: Minimizing suffix activation projections and token cross-entropy only optimizes local hidden states at the suffix tokens. Gemma-3's downstream safety checks are robust enough to disregard these adversarial localized states and refuse generation.
+  * **Multilingual Safety**: Under adversarial pressure, the model shifted its generation language to Marathi but did not bypass safety limits, confirming **language-agnostic safety training**.
+
+---
+
+## Google Colab Quick Start
+
+Run the entire ACT-Break pipeline on Google Colab with a single command:
+
+1. Open a new Colab notebook and select a GPU runtime (T4 for free tier, A100 for Pro).
+2. Run the following in a cell:
+
+```bash
+!git clone https://github.com/IrohAmca/ACT-Break.git
+%cd ACT-Break
+!python colab_runner.py
+```
+
+The script will automatically:
+- Install all dependencies via `uv`
+- Run the full 6-step pipeline
+- Upload results to Google Drive at `My Drive/ACT-Break-Results/`
 
 ---
 
@@ -112,6 +159,7 @@ All execution scripts are located under the `scripts/` directory and should be r
 ```text
 ACT-Break/
 |-- config.py                       # Central configuration (hyperparameters, paths)
+|-- colab_runner.py                 # Google Colab single-command pipeline runner
 |-- pyproject.toml                  # UV project configuration and dependencies
 |-- uv.lock                         # Lockfile for reproducible environment
 |-- data/
@@ -123,25 +171,27 @@ ACT-Break/
 |   |-- activation_collector.py     # Contrastive activation collector
 |   |-- probe_trainer.py            # Logistic regression probe trainer
 |   |-- direction_extractor.py      # Direction extractor and PCA plotting
-|   |-- activation_steering.py      # Causal activation steering implementation
-|   |-- loss_functions.py           # Multi-objective CE + activation loss functions
+|   |-- activation_steering.py      # Multi-layer causal activation steering
+|   |-- loss_functions.py           # Multi-layer CE + activation loss functions
 |   |-- token_gradients.py          # Token-level gradients calculator (one-hot trick)
-|   |-- gcg_optimizer.py            # GCG optimization loop with mini-batching
-|   `-- validation.py               # [NEW] Multi-stage Validation library
+|   |-- gcg_optimizer.py            # Multi-layer GCG optimization loop
+|   `-- validation.py               # Multi-stage Validation library
 |-- scripts/
 |   |-- 01_collect_activations.py   # Run: collect model activations
 |   |-- 02_train_probe.py           # Run: train linear probes
-|   |-- 03_extract_direction.py     # Run: extract jailbreak direction vector
-|   |-- 04_steering_validation.py   # Run: steering validation sweep
-|   |-- 05_optimize_suffix.py       # Run: suffix optimization & comparison tests
-|   `-- 06_multi_stage_validation.py # [NEW] Run: multi-stage validation checks
-`-- outputs/                        # Artifacts, plots, and models (git ignored)
+|   |-- 03_extract_direction.py     # Run: extract jailbreak direction vectors (all layers)
+|   |-- 04_steering_validation.py   # Run: multi-layer steering validation sweep
+|   |-- 05_optimize_suffix.py       # Run: multi-layer suffix optimization & comparison
+|   `-- 06_multi_stage_validation.py # Run: multi-stage validation checks
+`-- outputs/<model-name>/           # Artifacts, plots, and models (git ignored)
     |-- activations/                # Saved hidden states
     |-- probes/                     # Saved probes and validation results
+    |-- direction_probe.pt          # Best single-layer direction vector
+    |-- directions_multi.pt         # All target layer direction vectors (multi-layer GCG)
     |-- figures/                    # PCA and projection plots
     |-- steering/                   # Activation steering results
     |-- optimization/               # Optimized suffixes, loss curves, and summary
-    `-- validation/                 # [NEW] Validation reports and heatmaps
+    `-- validation/                 # Validation reports and heatmaps
 ```
 
 ## License

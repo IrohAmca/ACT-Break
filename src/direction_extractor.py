@@ -3,8 +3,8 @@ import torch
 from sklearn.decomposition import PCA
 
 def extract_direction_from_probe(probe, layer_idx: int) -> dict:
-    w = probe.coef_[0]
-    b = probe.intercept_[0]
+    w = probe.coef_[0].astype(np.float32)
+    b = float(probe.intercept_[0])
     w_norm = w / np.linalg.norm(w)
 
     print(f"[+] Extracted probe direction vector (L{layer_idx})")
@@ -17,7 +17,7 @@ def extract_direction_from_probe(probe, layer_idx: int) -> dict:
     }
 
 def extract_direction_from_difference(activations_data: dict, layer_idx: int) -> dict:
-    acts = activations_data["activations"][layer_idx].numpy()
+    acts = activations_data["activations"][layer_idx].numpy().astype(np.float32)
     labels = activations_data["labels"].numpy()
 
     refusal_acts = acts[labels == 0]
@@ -38,18 +38,18 @@ def extract_direction_from_difference(activations_data: dict, layer_idx: int) ->
     }
 
 def compare_directions(dir1: dict, dir2: dict) -> float:
-    v1 = dir1["direction"].numpy()
-    v2 = dir2["direction"].numpy()
+    v1 = dir1["direction"].numpy().astype(np.float32)
+    v2 = dir2["direction"].numpy().astype(np.float32)
 
     cosine_sim = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
     print(f"\n[~] Direction Comparison Similarity: {cosine_sim:.4f}")
     return float(cosine_sim)
 
 def compute_projections(activations_data: dict, direction: torch.Tensor, layer_idx: int) -> dict:
-    acts = activations_data["activations"][layer_idx].numpy()
+    acts = activations_data["activations"][layer_idx].numpy().astype(np.float32)
     labels = activations_data["labels"].numpy()
 
-    projections = acts @ direction.numpy()
+    projections = acts @ direction.numpy().astype(np.float32)
     refusal_proj = projections[labels == 0]
     compliance_proj = projections[labels == 1]
 
@@ -65,7 +65,7 @@ def compute_projections(activations_data: dict, direction: torch.Tensor, layer_i
 def visualize_pca(activations_data: dict, layer_idx: int, save_path: str | None = None):
     import matplotlib.pyplot as plt
 
-    acts = activations_data["activations"][layer_idx].numpy()
+    acts = activations_data["activations"][layer_idx].numpy().astype(np.float32)
     labels = activations_data["labels"].numpy()
 
     pca = PCA(n_components=2, random_state=42)
@@ -90,9 +90,9 @@ def visualize_pca(activations_data: dict, layer_idx: int, save_path: str | None 
 def visualize_projections(activations_data: dict, direction: torch.Tensor, layer_idx: int, save_path: str | None = None):
     import matplotlib.pyplot as plt
 
-    acts = activations_data["activations"][layer_idx].numpy()
+    acts = activations_data["activations"][layer_idx].numpy().astype(np.float32)
     labels = activations_data["labels"].numpy()
-    projections = acts @ direction.numpy()
+    projections = acts @ direction.numpy().astype(np.float32)
 
     fig, ax = plt.subplots(1, 1, figsize=(8, 4))
     ax.hist(projections[labels == 0], bins=30, alpha=0.6, color="#e74c3c", label="Refusal", density=True)
@@ -109,6 +109,29 @@ def visualize_projections(activations_data: dict, direction: torch.Tensor, layer
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"[+] Saved projection plot: {save_path}")
     plt.close(fig)
+
+def extract_all_layer_directions(probe_results: dict, target_layers: list[int]) -> dict:
+    """Extracts normalized probe direction vectors for all target layers.
+
+    Returns dict mapping layer_idx -> normalized direction tensor.
+    Also includes 'best_layer' key.
+    """
+    directions = {}
+    best_layer = probe_results["best_layer"]
+
+    for layer_idx in target_layers:
+        probe = probe_results["probes"][layer_idx]
+        w = probe.coef_[0].astype(np.float32)
+        w_norm = w / np.linalg.norm(w)
+        directions[layer_idx] = torch.tensor(w_norm, dtype=torch.float32)
+        print(f"  [+] Extracted direction for L{layer_idx}")
+
+    print(f"[+] Extracted {len(directions)} layer directions (best=L{best_layer})")
+    return {
+        "directions": directions,
+        "best_layer": best_layer,
+        "layers": target_layers,
+    }
 
 def save_direction(direction_data: dict, output_path: str):
     torch.save(direction_data, output_path)

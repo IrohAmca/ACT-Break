@@ -1,3 +1,6 @@
+import os
+os.environ["TORCHDYNAMO_DISABLE"] = "1"
+
 import torch
 import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer

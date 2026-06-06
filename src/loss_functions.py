@@ -2,67 +2,77 @@ import torch
 import torch.nn.functional as F
 
 def compute_loss(logits, hidden_states, input_ids, suffix_slice, target_slice,
-                 direction_vec, direction_layer, alpha=1.0, beta=0.3):
+                 direction_vecs, direction_layers, alpha=1.0, beta=0.3,
+                 aggregation='mean'):
     """
-    Computes the combined loss for GCG.
+    Computes the combined multi-layer loss for GCG.
     
     L = alpha * L_target + beta * L_activation
     
     Args:
         logits: Tensor of shape [batch_size, seq_len, vocab_size]
-        hidden_states: tuple of tensors, where hidden_states[direction_layer + 1] has shape [batch_size, seq_len, hidden_dim]
+        hidden_states: tuple of tensors from output_hidden_states=True
         input_ids: Tensor of shape [batch_size, seq_len] or [seq_len]
         suffix_slice: slice object indicating the positions of the suffix tokens
         target_slice: slice object indicating the positions of the target tokens
-        direction_vec: Tensor of shape [hidden_dim]
-        direction_layer: int, the index of the target layer (e.g. 12)
+        direction_vecs: dict mapping layer_idx -> direction Tensor of shape [hidden_dim]
+        direction_layers: list of int, the target layer indices (e.g. [8,9,10,11,12,13,14])
         alpha: float, weight for target CE loss
         beta: float, weight for activation projection loss
+        aggregation: str, how to aggregate per-layer activation losses:
+            'mean' - average across layers (for gradient computation, all layers contribute)
+            'max'  - worst layer determines the loss (minimax, for candidate selection:
+                     forces ALL layers to converge toward target simultaneously)
     """
     batch_size = logits.shape[0]
     
     # 1. Target Loss (Cross-Entropy)
-    # The targets are at target_slice.
-    # The logits that predict them are shifted by 1 to the left (i.e. target_slice.start - 1 to target_slice.stop - 1)
     loss_start = target_slice.start - 1
     loss_stop = target_slice.stop - 1
     
-    # Extract logits for target tokens: [batch_size, target_len, vocab_size]
     target_logits = logits[:, loss_start:loss_stop, :]
     
-    # Get target token IDs
     if input_ids.dim() == 1:
         target_ids = input_ids[target_slice].unsqueeze(0).expand(batch_size, -1)
     else:
         target_ids = input_ids[:, target_slice]
         
-    # Reshape for cross_entropy: input is [N, C], target is [N]
     loss_target = F.cross_entropy(
         target_logits.reshape(-1, target_logits.shape[-1]),
         target_ids.reshape(-1),
         reduction="none"
     )
-    # Average per batch item
     target_len = target_slice.stop - target_slice.start
     loss_target = loss_target.view(batch_size, target_len).mean(dim=1)
     
-    # 2. Activation Loss
-    # We want to pull target layer's output at suffix positions in the direction of direction_vec.
-    # L_activation = -mean(hidden_states[direction_layer][:, suffix_positions, :] @ V_jailbreak)
-    # Output of layers[idx] is hidden_states[idx + 1].
-    layer_output = hidden_states[direction_layer + 1] # shape [batch_size, seq_len, hidden_dim]
+    # 2. Multi-Layer Activation Loss
+    # For each target layer, compute the negative projection of suffix activations
+    # onto the layer's direction vector.
+    layer_losses = []
+    for layer_idx in direction_layers:
+        # Output of layers[idx] is hidden_states[idx + 1]
+        layer_output = hidden_states[layer_idx + 1]  # [batch_size, seq_len, hidden_dim]
+        suffix_acts = layer_output[:, suffix_slice, :]  # [batch_size, suffix_len, hidden_dim]
+        
+        d_vec = direction_vecs[layer_idx].to(suffix_acts.device).to(suffix_acts.dtype)
+        
+        # Dot product per token: [batch_size, suffix_len]
+        projections = torch.einsum("bsd,d->bs", suffix_acts, d_vec)
+        
+        # Negative projection (we want to maximize projection = minimize negative)
+        layer_losses.append(-projections.mean(dim=1))  # [batch_size]
     
-    # Suffix activations: [batch_size, suffix_len, hidden_dim]
-    suffix_acts = layer_output[:, suffix_slice, :]
+    # Aggregate across layers: [num_layers, batch_size] -> [batch_size]
+    stacked_layer_losses = torch.stack(layer_losses)  # [num_layers, batch_size]
     
-    # Project onto direction_vec. direction_vec has shape [hidden_dim]
-    d_vec = direction_vec.to(suffix_acts.device).to(suffix_acts.dtype)
-    
-    # Dot product/projection per token: [batch_size, suffix_len]
-    projections = torch.einsum("bsd,d->bs", suffix_acts, d_vec)
-    
-    # Minimize negative projection (maximize projection)
-    loss_activation = -projections.mean(dim=1)
+    if aggregation == 'max':
+        # Minimax: the WORST-performing layer determines the loss.
+        # This forces candidate selection to pick tokens that improve ALL layers,
+        # preventing the optimizer from sacrificing some layers for others.
+        loss_activation = stacked_layer_losses.max(dim=0).values
+    else:
+        # Mean: all layers contribute equally (good for gradient computation)
+        loss_activation = stacked_layer_losses.mean(dim=0)
     
     # Combined loss per batch item: [batch_size]
     combined_loss = alpha * loss_target + beta * loss_activation

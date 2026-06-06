@@ -182,7 +182,7 @@ def main():
     plt.plot(orig_projs, label="Original Prompt (Refusal)", color="red", marker="o", linewidth=2)
     plt.plot(jail_projs, label="Prompt + Suffix (Jailbreak)", color="blue", marker="x", linewidth=2)
     plt.axhline(y=0.0, color="gray", linestyle="--", alpha=0.7, label="Neutral Threshold")
-    plt.title(f"Logit Lens Projection Trajectory (L12) - Prompt {target_idx+1}")
+    plt.title(f"Logit Lens Projection Trajectory (L{layer_idx}) - Prompt {target_idx+1}")
     plt.xlabel("Generated Token Index")
     plt.ylabel("Projection score onto V_jailbreak")
     plt.legend()

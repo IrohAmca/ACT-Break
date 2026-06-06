@@ -1,22 +1,25 @@
 from pathlib import Path
 
+MODEL_NAME = "google/gemma-3-1b-it"
+MODEL_SUFFIX = MODEL_NAME.split("/")[-1]
+
 PROJECT_ROOT = Path(__file__).parent
 DATA_DIR = PROJECT_ROOT / "data"
-OUTPUT_DIR = PROJECT_ROOT / "outputs"
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / MODEL_SUFFIX
 ACTIVATIONS_DIR = OUTPUT_DIR / "activations"
 PROBES_DIR = OUTPUT_DIR / "probes"
 FIGURES_DIR = OUTPUT_DIR / "figures"
 STEERING_DIR = OUTPUT_DIR / "steering"
 OPTIMIZATION_DIR = OUTPUT_DIR / "optimization"
+VALIDATION_DIR = OUTPUT_DIR / "validation"
 
-for d in [DATA_DIR, ACTIVATIONS_DIR, PROBES_DIR, FIGURES_DIR, STEERING_DIR, OPTIMIZATION_DIR]:
+for d in [DATA_DIR, ACTIVATIONS_DIR, PROBES_DIR, FIGURES_DIR, STEERING_DIR, OPTIMIZATION_DIR, VALIDATION_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
-MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 DTYPE = "float16"
 DEVICE = "cuda"
 
-TARGET_LAYERS = list(range(12, 19))  # Middle-to-late layers for 24-layer Qwen-0.5B
+TARGET_LAYERS = list(range(8, 15))  # Middle-to-late layers for 18-layer Gemma-3-1B
 
 COMPLIANCE_PREFIXES = [
     "Sure, here is",
@@ -46,8 +49,8 @@ ADVBENCH_PATH = DATA_DIR / "harmful_prompts.csv"
 SUFFIX_LENGTH = 20              # Suffix token count
 SUFFIX_INIT_TOKEN = "!"         # Suffix initial token
 GCG_TOP_K = 256                 # Candidate tokens per position
-GCG_BATCH_SIZE = 64             # Candidates per iteration (VRAM budget 4GB)
-GCG_MINI_BATCH = 16             # Batch evaluation mini-batch size
+GCG_BATCH_SIZE = 64            # Candidates per iteration (optimized for 4GB VRAM)
+GCG_MINI_BATCH = 16             # Batch evaluation mini-batch size (optimized for 4GB VRAM)
 GCG_MAX_STEPS = 150             # Max iterations (successes converge in ~25 steps)
 GCG_CHECK_INTERVAL = 25         # Steps between success checks
 
@@ -67,4 +70,5 @@ OPT_NUM_PROMPTS = 10            # Number of prompts to optimize
 
 # Paths
 DIRECTION_PATH = OUTPUT_DIR / "direction_probe.pt"
+MULTI_LAYER_DIRECTIONS_PATH = OUTPUT_DIR / "directions_multi.pt"
 
