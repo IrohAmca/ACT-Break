@@ -3,7 +3,7 @@ os.environ["TORCHDYNAMO_DISABLE"] = "1"
 
 import torch
 import transformers
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerFast
 
 class ActivationStore:
     """Stores activations captured at forward hooks."""
@@ -17,7 +17,7 @@ class ActivationStore:
         return self.activations.get(layer_idx)
 
 class HookedModel:
-    """Wrapper around Qwen model to register forward hooks and extract hidden states."""
+    """Wrapper around causal LMs to register forward hooks and extract hidden states."""
     def __init__(self, model_name: str, target_layers: list[int], dtype: str = "float16", device: str = "cuda"):
         self.model_name = model_name
         self.target_layers = target_layers
@@ -31,11 +31,7 @@ class HookedModel:
 
     def load(self):
         print(f"[*] Loading model: {self.model_name}")
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_name,
-            trust_remote_code=True,
-            padding_side="left",
-        )
+        self.tokenizer = self._load_tokenizer()
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -58,6 +54,25 @@ class HookedModel:
         params = sum(p.numel() for p in self.model.parameters()) / 1e6
         print(f"[+] Loaded {self.model_name} ({params:.0f}M parameters)")
         return self
+
+    def _load_tokenizer(self):
+        try:
+            return AutoTokenizer.from_pretrained(
+                self.model_name,
+                trust_remote_code=True,
+                padding_side="left",
+            )
+        except ValueError as exc:
+            message = str(exc)
+            if "Tokenizer class" not in message or "does not exist" not in message:
+                raise
+
+            print("[!] AutoTokenizer could not resolve the tokenizer class.")
+            print("[!] Falling back to PreTrainedTokenizerFast from tokenizer.json.")
+            return PreTrainedTokenizerFast.from_pretrained(
+                self.model_name,
+                padding_side="left",
+            )
 
     def _register_hooks(self):
         for layer_idx in self.target_layers:
