@@ -140,9 +140,9 @@ Latest Colab run: 2026-06-07, 10 AdvBench harmful prompts, multi-layer GCG over 
 
 ## Google Colab Quick Start
 
-You can run the entire ACT-Break pipeline on Google Colab using our interactive Jupyter Notebook:
+You can run the entire ACT-Break pipeline on Google Colab using the interactive notebooks under `colab/`:
 
-1. Upload the [ACT_Break_Colab.ipynb](ACT_Break_Colab.ipynb) notebook to your Google Colab instance.
+1. Upload [colab_notebook.ipynb](colab/colab_notebook.ipynb) for the default Gemma/Qwen flow, or [colab_notebook_karakumru.ipynb](colab/colab_notebook_karakumru.ipynb) for the Turkish Kara-Kumru flow.
 2. Select a GPU runtime (T4 for free tier, or L4/A100 for Colab Pro users to achieve high optimization speeds).
 3. Run the cells sequentially to clone the repository, install the `uv` environment, execute each step of the pipeline, and back up the results to Google Drive.
 
@@ -155,8 +155,9 @@ The notebook will automatically mount Google Drive and upload all generated plot
 ```text
 ACT-Break/
 |-- config.py                       # Central configuration (hyperparameters, paths)
-|-- ACT_Break_Colab.ipynb           # Jupyter Notebook for Google Colab pipeline execution
-|-- colab_runner.py                 # Command-line helper script for Google Colab execution
+|-- colab/
+|   |-- colab_notebook.ipynb        # Default Google Colab pipeline notebook
+|   `-- colab_notebook_karakumru.ipynb # Turkish Kara-Kumru Google Colab notebook
 |-- pyproject.toml                  # UV project configuration and dependencies
 |-- uv.lock                         # Lockfile for reproducible environment
 |-- data/

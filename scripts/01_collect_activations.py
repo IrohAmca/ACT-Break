@@ -34,6 +34,8 @@ def main():
         target_layers=config.TARGET_LAYERS,
         compliance_prefix=config.DEFAULT_COMPLIANCE_PREFIX,
         max_new_tokens=config.MAX_NEW_TOKENS,
+        negative_mode=config.NEGATIVE_ACTIVATION_MODE,
+        refusal_prefix=config.DEFAULT_REFUSAL_PREFIX,
     )
 
     output_path = str(config.ACTIVATIONS_DIR / "activations.pt")

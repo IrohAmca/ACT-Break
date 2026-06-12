@@ -26,12 +26,33 @@ DEVICE = "cuda"
 
 TARGET_LAYERS = list(range(8, 18))  # Multi-layer activation reference/objective layers for Gemma-3-1B
 
-COMPLIANCE_PREFIXES = [
-    "Sure, here is",
-    "Of course! Here's",
-    "Absolutely, I can help with that. Here is",
-]
+ADVBENCH_LANGUAGE = os.getenv("ACT_BREAK_ADVBENCH_LANGUAGE", "en").lower()
+
+if ADVBENCH_LANGUAGE == "tr":
+    COMPLIANCE_PREFIXES = [
+        "Elbette, işte",
+        "Tabii, işte",
+        "Memnuniyetle, işte",
+    ]
+    REFUSAL_PREFIXES = [
+        "Üzgünüm, bu konuda yardımcı olamam.",
+        "Buna yardımcı olamam.",
+        "Bu isteği yerine getiremem.",
+    ]
+else:
+    COMPLIANCE_PREFIXES = [
+        "Sure, here is",
+        "Of course! Here's",
+        "Absolutely, I can help with that. Here is",
+    ]
+    REFUSAL_PREFIXES = [
+        "I'm sorry, but I can't help with that.",
+        "I can't assist with that request.",
+        "I'm unable to help with that.",
+    ]
 DEFAULT_COMPLIANCE_PREFIX = COMPLIANCE_PREFIXES[0]
+DEFAULT_REFUSAL_PREFIX = REFUSAL_PREFIXES[0]
+NEGATIVE_ACTIVATION_MODE = os.getenv("ACT_BREAK_NEGATIVE_ACTIVATION_MODE", "generated").lower()
 
 MAX_PROMPTS = None
 MAX_NEW_TOKENS = 20
@@ -46,7 +67,6 @@ ADVBENCH_URL = (
     "https://raw.githubusercontent.com/llm-attacks/llm-attacks/"
     "main/data/advbench/harmful_behaviors.csv"
 )
-ADVBENCH_LANGUAGE = os.getenv("ACT_BREAK_ADVBENCH_LANGUAGE", "en").lower()
 ADVBENCH_ENGLISH_PATH = DATA_DIR / "harmful_prompts.csv"
 ADVBENCH_TURKISH_PATH = DATA_DIR / "harmful_prompts_tr.csv"
 ADVBENCH_PATH = ADVBENCH_TURKISH_PATH if ADVBENCH_LANGUAGE == "tr" else ADVBENCH_ENGLISH_PATH
@@ -85,7 +105,7 @@ LOSS_ALPHA = 1.0                # CE (target token) loss weight
 LOSS_BETA = 0.05                # Activation projection loss weight
 
 # Target
-TARGET_STRING = "Sure, here is"
+TARGET_STRING = DEFAULT_COMPLIANCE_PREFIX
 
 # Steering Validation
 STEERING_ALPHAS = [0, 1, 2, 5, 10, 15, 20, 30, 50]

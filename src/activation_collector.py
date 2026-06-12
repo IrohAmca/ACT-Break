@@ -53,9 +53,22 @@ def first_n_decoded_tokens(tokenizer, text: str, token_count: int) -> str:
         return text.strip()
     return tokenizer.decode(token_ids[:token_count], skip_special_tokens=True).strip()
 
-def collect_activations(hooked_model, prompts: list[dict], target_layers: list[int],
-                        compliance_prefix: str, max_new_tokens: int = 20):
+def collect_activations(
+    hooked_model,
+    prompts: list[dict],
+    target_layers: list[int],
+    compliance_prefix: str,
+    max_new_tokens: int = 20,
+    negative_mode: str = "generated",
+    refusal_prefix: str | None = None,
+):
     import torch
+
+    negative_mode = negative_mode.lower()
+    if negative_mode not in {"generated", "forced_refusal"}:
+        raise ValueError("negative_mode must be 'generated' or 'forced_refusal'")
+    if negative_mode == "forced_refusal" and not refusal_prefix:
+        raise ValueError("refusal_prefix is required when negative_mode='forced_refusal'")
 
     all_activations = {layer: [] for layer in target_layers}
     all_labels = []
@@ -67,32 +80,38 @@ def collect_activations(hooked_model, prompts: list[dict], target_layers: list[i
 
     print("\n" + "="*50)
     print("Collecting Contrastive Activations")
+    print(f"Negative activation mode: {negative_mode}")
     print("="*50 + "\n")
 
     for i, prompt_data in enumerate(tqdm(prompts, desc="Collecting activations")):
         goal = prompt_data["goal"]
+        assistant_prompt_text = hooked_model.format_chat(goal, assistant_prefix=None)
 
-        # 1. Refusal Pass (Normal Generation)
-        hooked_model.store.clear()
-        refusal_text = hooked_model.format_chat(goal, assistant_prefix=None)
-        refusal_inputs = hooked_model.tokenize(refusal_text)
+        # 1. Negative Pass
+        if negative_mode == "generated":
+            hooked_model.store.clear()
+            refusal_inputs = hooked_model.tokenize(assistant_prompt_text)
 
-        output_ids = hooked_model.generate(
-            refusal_inputs["input_ids"],
-            attention_mask=refusal_inputs.get("attention_mask"),
-            max_new_tokens=max_new_tokens,
-        )
-        generated_text = hooked_model.decode(output_ids[0][refusal_inputs["input_ids"].shape[1]:])
+            output_ids = hooked_model.generate(
+                refusal_inputs["input_ids"],
+                attention_mask=refusal_inputs.get("attention_mask"),
+                max_new_tokens=max_new_tokens,
+            )
+            generated_text = hooked_model.decode(output_ids[0][refusal_inputs["input_ids"].shape[1]:])
+            refusal_prefix_source = generated_text
+        else:
+            generated_text = refusal_prefix
+            refusal_prefix_source = refusal_prefix
+
         refusal_responses.append(generated_text)
 
         # Capture refusal/compliance activations at the same response depth.
         refusal_prefix = first_n_decoded_tokens(
             hooked_model.tokenizer,
-            generated_text,
+            refusal_prefix_source,
             max(1, compliance_token_count),
         )
         refusal_prefixes.append(refusal_prefix)
-        assistant_prompt_text = hooked_model.format_chat(goal, assistant_prefix=None)
         refusal_prefix_text = assistant_prompt_text + refusal_prefix
         refusal_prefix_inputs = hooked_model.tokenize(refusal_prefix_text)
 
@@ -136,6 +155,7 @@ def collect_activations(hooked_model, prompts: list[dict], target_layers: list[i
         "refusal_responses": refusal_responses,
         "refusal_prefixes": refusal_prefixes,
         "compliance_prefix": compliance_prefix,
+        "negative_mode": negative_mode,
         "activation_position": "assistant_prefix_last_token",
     }
 
@@ -145,6 +165,8 @@ def collect_activations(hooked_model, prompts: list[dict], target_layers: list[i
     return result
 
 def save_activations(result: dict, output_path: str):
+    import torch
+
     torch.save(result, output_path)
     import os
     print(f"[+] Saved activations to: {output_path} ({os.path.getsize(output_path) / (1024 * 1024):.1f} MB)")
