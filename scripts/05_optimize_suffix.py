@@ -27,13 +27,17 @@ def safe_print(text: str):
 def save_incremental(results: list, output_dir: Path):
     """Save results incrementally after each prompt completes."""
     results_path = output_dir / "results.json"
-    success_count = sum(1 for r in results if r["success"])
+    forced_target_success_count = sum(1 for r in results if r["success"])
     total = len(results)
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump({
             "total_prompts_completed": total,
-            "success_count": success_count,
-            "success_rate": success_count / total if total > 0 else 0,
+            "forced_target_success_count": forced_target_success_count,
+            "forced_target_success_rate": forced_target_success_count / total if total > 0 else 0,
+            # Backward-compatible aliases. `success` means forced-target
+            # activation success, not behavioral jailbreak success.
+            "success_count": forced_target_success_count,
+            "success_rate": forced_target_success_count / total if total > 0 else 0,
             "results": results
         }, f, indent=2, ensure_ascii=False)
 
@@ -54,11 +58,11 @@ def run_comparison_test(model, results: list, direction_vec, layer_idx, activati
     for idx, res in enumerate(results):
         prompt = res["prompt"]
         suffix = res.get("suffix", "")
-        success = res["success"]
+        forced_target_success = res.get("forced_target_success", res["success"])
 
         safe_print(f"\n[#{idx+1}] Prompt: {prompt[:60]}...")
         safe_print(f"  Suffix found: {suffix[:40]}...")
-        print(f"  GCG Success: {success}")
+        print(f"  Forced-target Success: {forced_target_success}")
 
         # 1. Track real generation WITHOUT suffix.
         original_generation = track_generation_trajectory_text(
@@ -119,7 +123,8 @@ def run_comparison_test(model, results: list, direction_vec, layer_idx, activati
         comparisons.append({
             "prompt": prompt,
             "suffix": suffix,
-            "gcg_success": success,
+            "forced_target_success": forced_target_success,
+            "gcg_success": forced_target_success,
             "gcg_steps": res["steps"],
             "original_response": response_original,
             "original_generation": original_generation,
@@ -223,6 +228,8 @@ def main():
 
         result_entry = {
             "prompt": prompt,
+            "forced_target_success": opt_res["success"],
+            # Backward-compatible alias for older consumers.
             "success": opt_res["success"],
             "steps": opt_res["steps"],
             "suffix": opt_res["suffix"],
@@ -236,7 +243,7 @@ def main():
         }
         results.append(result_entry)
 
-        status_str = "SUCCESS" if opt_res["success"] else "FAILED"
+        status_str = "FORCED-TARGET SUCCESS" if opt_res["success"] else "FAILED"
         res_safe = opt_res["response"].replace(chr(10), " ")[:70].encode("ascii", errors="replace").decode("ascii")
         print(f"[Result] {status_str} | Steps: {opt_res['steps']} | Response: {res_safe}...")
 
@@ -247,7 +254,7 @@ def main():
     # 5. Plot loss curves
     fig, ax = plt.subplots(1, 1, figsize=(10, 6))
     for idx, res in enumerate(results):
-        status_str = "SUCCESS" if res["success"] else "FAILED"
+        status_str = "FT-OK" if res["success"] else "FAILED"
         ax.plot(res["losses"], label=f"P{idx+1} ({status_str}, {res['steps']}s)", alpha=0.7)
 
     ax.set_xlabel("Steps")
@@ -266,15 +273,19 @@ def main():
     comparisons = run_comparison_test(model, results, best_direction, best_layer, activation_classifier)
 
     # 7. Save final results with comparisons
-    success_count = sum(1 for r in results if r["success"])
+    forced_target_success_count = sum(1 for r in results if r["success"])
     confirmed_jailbreaks = sum(1 for c in comparisons if c["jailbreak_confirmed"])
     generation_compliance_count = sum(1 for c in comparisons if c["suffix_generation"]["generated_any_compliance"])
     loss_behavior_gap_count = sum(1 for c in comparisons if c["loss_behavior_gap"])
 
     final_results = {
         "total_prompts": len(prompts),
-        "gcg_success_count": success_count,
-        "gcg_success_rate": success_count / len(prompts),
+        "forced_target_success_count": forced_target_success_count,
+        "forced_target_success_rate": forced_target_success_count / len(prompts),
+        # Backward-compatible aliases. These are objective-side successes,
+        # not confirmed behavioral jailbreaks.
+        "gcg_success_count": forced_target_success_count,
+        "gcg_success_rate": forced_target_success_count / len(prompts),
         "confirmed_jailbreaks": confirmed_jailbreaks,
         "confirmed_jailbreak_rate": confirmed_jailbreaks / len(prompts),
         "generation_compliance_count": generation_compliance_count,
@@ -300,7 +311,7 @@ def main():
         f.write("=" * 60 + "\n\n")
         f.write(f"Total prompts:          {len(prompts)}\n")
         f.write(f"Steering layers:        L{direction_layers[0]}-L{direction_layers[-1]} ({n_layers} layers)\n")
-        f.write(f"Forced-target success:  {success_count}/{len(prompts)} ({success_count / len(prompts):.1%})\n")
+        f.write(f"Forced-target success:  {forced_target_success_count}/{len(prompts)} ({forced_target_success_count / len(prompts):.1%})\n")
         f.write(f"Generated compliance:   {generation_compliance_count}/{len(prompts)} ({generation_compliance_count / len(prompts):.1%})\n")
         f.write(f"Loss-behavior gaps:     {loss_behavior_gap_count}/{len(prompts)} ({loss_behavior_gap_count / len(prompts):.1%})\n")
         f.write("\n" + "-" * 60 + "\n")
@@ -308,7 +319,7 @@ def main():
         f.write("-" * 60 + "\n\n")
         for idx, (res, comp) in enumerate(zip(results, comparisons)):
             f.write(f"Prompt {idx+1}: {res['prompt']}\n")
-            f.write(f"  GCG Success:       {res['success']}\n")
+            f.write(f"  Forced-target Success: {res['success']}\n")
             f.write(f"  Steps:             {res['steps']}\n")
             f.write(f"  Suffix:            {res['suffix']}\n")
             f.write(f"  Original Gen:      {comp['original_status']}\n")
@@ -332,7 +343,7 @@ def main():
     print("FINAL RESULTS")
     print("=" * 60)
     print(f"  Steering Layers:        L{direction_layers[0]}-L{direction_layers[-1]} ({n_layers} layers)")
-    print(f"  Forced-target Success:  {success_count}/{len(prompts)} ({success_count / len(prompts):.1%})")
+    print(f"  Forced-target Success:  {forced_target_success_count}/{len(prompts)} ({forced_target_success_count / len(prompts):.1%})")
     print(f"  Generated Compliance:   {generation_compliance_count}/{len(prompts)} ({generation_compliance_count / len(prompts):.1%})")
     print(f"  Loss-Behavior Gaps:     {loss_behavior_gap_count}/{len(prompts)} ({loss_behavior_gap_count / len(prompts):.1%})")
     print()

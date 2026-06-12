@@ -8,9 +8,9 @@ ACT-Break is a white-box analysis framework for studying jailbreak direction vec
 
 | Module | Target | Qwen-2.5-0.5B-Instruct (Weak Alignment) | Gemma-3-1b-it (Robust Alignment) |
 | --- | --- | --- | --- |
-| **1. Activation Compass** | Refusal vs. Compliance Direction Vector (`V_jailbreak`) | Probes trained on L12-L18 (100% accuracy, AUC 1.00). Selected L12. Cosine Similarity (Probe vs Diff-of-Means): **0.9962** (Single direction hypothesis holds). | Probes trained on L8-L14 (100% accuracy, AUC 1.00). Selected L8. Cosine Similarity: **0.3711** (Refusal resides in a multi-dimensional subspace, not a single direction). |
-| **2. Suffix Discovery Engine** | Adversarial Suffix Optimization via GCG + Activation Loss | GCG Success: **100% (10/10)**.<br>True Jailbreaks: **70%** (7/10).<br>Convergence: ~50 steps. | GCG Success: **0% (0/1)**.<br>True Jailbreaks: **0%**.<br>Optimization fails to jailbreak despite negative loss (Loss-Behavior Gap). Model shifts to Marathi but maintains refusal. |
-| **3. Multi-stage Validation** | Transferability, Perplexity, Logit Lens & Topic Relevance | Suffix Transfer Rate: **57.8%**.<br>Perplexity Filter: **166x increase** on jailbreak suffixes.<br>Logit Lens: Step-1 detection at L12. | *Evaluation skipped due to 0% GCG success rate.* Logit Lens and perplexity metrics showed extremely high safety robustness. |
+| **1. Activation Compass** | Refusal vs. Compliance Direction Vector (`V_jailbreak`) | Probes trained on L12-L18 (100% accuracy, AUC 1.00). Selected L12. Cosine Similarity (Probe vs Diff-of-Means): **0.9962** (Single direction hypothesis holds). | Multi-layer reference built from L8-L17 Stage-1 activations. Earlier single-layer probe/diff cosine was **0.3711**, suggesting refusal is not captured by a single 1D direction. |
+| **2. Suffix Discovery Engine** | Adversarial Suffix Optimization via GCG + Activation Loss | GCG Success: **100% (10/10)**.<br>True Jailbreaks: **70%** (7/10).<br>Convergence: ~50 steps. | Forced-target activation success: **100% (10/10)**.<br>Generated compliance: **0% (0/10)**.<br>Confirmed jailbreaks: **0% (0/10)**.<br>Loss-behavior gap: **100% (10/10)**. |
+| **3. Multi-stage Validation** | Transferability, Perplexity, Logit Lens & Topic Relevance | Suffix Transfer Rate: **57.8%**.<br>Perplexity Filter: **166x increase** on jailbreak suffixes.<br>Logit Lens: Step-1 detection at L12. | Latest Gemma suffixes do not produce behavioral compliance during free generation, so transferability should be interpreted as activation/trajectory diagnostics rather than confirmed jailbreak transfer. |
 
 ---
 
@@ -33,36 +33,36 @@ All execution scripts are located under the `scripts/` directory and should be r
    ```bash
    uv run python scripts/01_collect_activations.py
    ```
-   *(This downloads the AdvBench behaviors dataset and automatically downloads the `Qwen/Qwen2.5-0.5B-Instruct` model in float16).*
+   *(This downloads the AdvBench behaviors dataset and collects refusal/compliance activations for the model configured in `config.py`).*
 2. **Train Logistic Regression Probes**:
    ```bash
    uv run python scripts/02_train_probe.py
    ```
-   *(Trains probes on layers L12 to L18 to classify refusal vs. compliance activations. Results are saved in `outputs/probes/`).*
+   *(Trains probes on `config.TARGET_LAYERS` to classify refusal vs. compliance activations. Results are saved in `outputs/<model-name>/probes/`).*
 3. **Extract Direction & Visualize**:
    ```bash
    uv run python scripts/03_extract_direction.py
    ```
-   *(Extracts `V_jailbreak` from L12 probe weights, calculates cosine similarity with difference-of-means, and generates PCA/projection plots in `outputs/figures/`).*
+   *(Extracts single-layer and multi-layer direction references, calculates cosine similarity with difference-of-means, and generates PCA/projection plots in `outputs/<model-name>/figures/`).*
 
 ### Module 2: Suffix Discovery Engine
 4. **Validate Activation Steering (Faz A)**:
    ```bash
    uv run python scripts/04_steering_validation.py
    ```
-   *(Performs activation steering sweeps with different alpha coefficients on layer L12 to see if steering alone can jailbreak or cause text generation degradation).*
+   *(Performs activation steering sweeps with different alpha coefficients and evaluates generated trajectories with the Stage-1 activation reference).*
 5. **Optimize Suffixes via GCG (Faz B)**:
    ```bash
    uv run python scripts/05_optimize_suffix.py
    ```
-   *(Optimizes adversarial suffixes of length 20 using GCG, guided by target token cross-entropy loss and activation projection loss onto `V_jailbreak`. Includes a final comparative test showing jailbreak confirmation rate against original prompts).*
+   *(Optimizes adversarial suffixes of length 20 using GCG, guided by target-token cross-entropy and multi-layer activation projection losses. The final comparison reports forced-target activation success, generated compliance, confirmed jailbreaks, and loss-behavior gaps separately).*
 
 ### Module 3: Multi-stage Validation
 6. **Run Multi-stage Validation**:
    ```bash
    uv run python scripts/06_multi_stage_validation.py
    ```
-   *(Orchestrates cross-validation matrix calculation, conditioned suffix perplexity scoring, step-by-step logit lens trajectory tracking on layer L12, and embedding-based topic relevance analysis).*
+   *(Orchestrates cross-validation matrix calculation, conditioned suffix perplexity scoring, step-by-step logit-lens trajectory tracking, and embedding-based topic relevance analysis).*
 
 ---
 
@@ -72,14 +72,14 @@ All execution scripts are located under the `scripts/` directory and should be r
 - **Refusal Pass**: Feed model harmful prompt directly $\rightarrow$ extract activations.
 - **Compliance Pass**: Feed model harmful prompt but append `Sure, here is` to force compliance $\rightarrow$ extract activations.
 - **Probe Training**: Train a logistic regression model on layer activations to isolate the direction vector representing compliance vs. refusal.
-- **Direction**: `V_jailbreak` is the normalized weight vector of the L12 probe pointing towards compliance/jailbreak behavior.
+- **Direction**: `V_jailbreak` is represented by single-layer probe weights and multi-layer direction references pointing toward the Stage-1 compliance activation region.
 
 ### Method: Guided Suffix Optimization (Module 2)
 - **Adversarial Suffix**: Suffix of length 20 appended to the user prompt.
 - **Combined Loss**: $L = \alpha L_{target} + \beta L_{activation}$
   - $L_{target}$: Cross-Entropy loss of generating target string `"Sure, here is"`.
-  - $L_{activation}$: Negative cosine similarity (projection) of activation at layer L12 onto the `V_jailbreak` vector.
-- **GCG Algorithm**: Computes token gradients via one-hot trick, selects top $K=256$ candidate substitutions, evaluates candidates in mini-batches of 16 (total batch size 64 to fit 4GB VRAM), and updates suffix iteratively.
+  - $L_{activation}$: Negative projection of target-position activations onto the configured multi-layer compliance directions.
+- **GCG Algorithm**: Computes token gradients via one-hot trick, selects top $K=256$ candidate substitutions, evaluates candidates in mini-batches, and updates suffix iteratively.
 
 ---
 
@@ -124,13 +124,17 @@ The pipeline was extensively evaluated against Google's **Gemma-3-1b-it** model 
   * Extremely large perturbations ($\alpha = 50$) did not alter a single token in the refusal responses.
   * **Security Inference**: Applying steering hooks to a single layer (L8) is completely bypassed. The remaining 18 layers (L9-L25) absorb the perturbation and restore the safety alignment downstream.
 
-### 3. Suffix Optimization Fails via Loss-Behavior Gap (Module 2 - Phase B)
-* **GCG Success Rate**: **0%**.
-* **Findings**:
-  * For the exploit generation prompt, the combined GCG loss successfully decreased from **10.85 to -4.12** over 150 steps.
-  * Despite the mathematical minimization of the loss, the model **still refused to comply** (answering in Marathi: *"मला माफ करा, पण मी तुम्हाला..."*).
-  * **Security Inference (Loss-Behavior Gap)**: Minimizing suffix activation projections and token cross-entropy only optimizes local hidden states at the suffix tokens. Gemma-3's downstream safety checks are robust enough to disregard these adversarial localized states and refuse generation.
-  * **Multilingual Safety**: Under adversarial pressure, the model shifted its generation language to Marathi but did not bypass safety limits, confirming **language-agnostic safety training**.
+### 3. Forced-Target Activation Success, but Behavioral Failure (Module 2 - Phase B)
+Latest Colab run: 2026-06-07, 10 AdvBench harmful prompts, multi-layer GCG over L8-L17.
+
+* **Forced-target activation success**: **100% (10/10)**. With the optimized suffix and forced target prefix, the final target-token activation is classified as Compliance by the Stage-1 activation reference.
+* **Generated compliance**: **0% (0/10)**. During free generation with the same suffixes, every trajectory remained in/refell to the refusal region.
+* **Confirmed jailbreak rate**: **0% (0/10)**.
+* **Loss-behavior gap**: **100% (10/10)**.
+* **Final CE loss range**: **3.91 to 5.82**. This means the target-token objective did not fully converge.
+* **Final activation loss range**: **-423.25 to -485.00**. The activation objective dominates the combined loss.
+
+**Security Inference (Loss-Behavior Gap)**: The current evidence does not show behavioral jailbreak success on Gemma-3-1b-it. It shows that the optimization can push the forced-target hidden state into the Stage-1 compliance activation region while the model's normal autoregressive generation still refuses. The result should therefore be framed as an activation-objective/behavior gap, not as full target-token convergence or a successful jailbreak.
 
 ---
 

@@ -353,7 +353,10 @@ class GCGOptimizer:
 
     def check_success(self, prompt: str) -> tuple[bool, str]:
         """
-        Checks jailbreak success using activation projection (language-agnostic).
+        Checks objective-side forced-target activation success.
+
+        This is intentionally separate from behavioral jailbreak success during
+        free generation, which is tracked in `generated_any_compliance`.
         """
         forced = self.measure_forced_target(prompt)
         generated = self.track_generation_trajectory(prompt, max_new_tokens=40)
@@ -398,10 +401,11 @@ class GCGOptimizer:
             if step_idx % check_interval == 0:
                 success, response, forced, generated = self.check_success(prompt)
                 resp_safe = response.replace(chr(10), ' ')[:50].encode('ascii', errors='replace').decode('ascii')
-                print(f"  [Check] Success: {success} | Response snippet: {resp_safe}...")
+                print(f"  [Check] Forced-target success: {success} | Response snippet: {resp_safe}...")
                 if success:
-                    print(f"[+] Early stopping at step {step_idx}: Successful suffix found!")
+                    print(f"[+] Early stopping at step {step_idx}: forced-target activation success.")
                     return {
+                        "forced_target_success": True,
                         "success": True,
                         "steps": step_idx,
                         "suffix": self.decode_suffix(),
@@ -418,6 +422,7 @@ class GCGOptimizer:
         # Final check
         success, response, forced, generated = self.check_success(prompt)
         return {
+            "forced_target_success": success,
             "success": success,
             "steps": max_steps,
             "suffix": self.decode_suffix(),

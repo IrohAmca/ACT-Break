@@ -24,7 +24,7 @@ for d in [DATA_DIR, ACTIVATIONS_DIR, PROBES_DIR, FIGURES_DIR, STEERING_DIR, OPTI
 DTYPE = "float16"
 DEVICE = "cuda"
 
-TARGET_LAYERS = list(range(8, 18))  # Middle-to-late layers for 18-layer Gemma-3-1B
+TARGET_LAYERS = list(range(8, 18))  # Multi-layer activation reference/objective layers for Gemma-3-1B
 
 COMPLIANCE_PREFIXES = [
     "Sure, here is",
@@ -94,4 +94,3 @@ OPT_NUM_PROMPTS = 10            # Number of prompts to optimize
 # Paths
 DIRECTION_PATH = OUTPUT_DIR / "direction_probe.pt"
 MULTI_LAYER_DIRECTIONS_PATH = OUTPUT_DIR / "directions_multi.pt"
-
