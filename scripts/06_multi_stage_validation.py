@@ -16,12 +16,10 @@ import config
 from src.model_loader import HookedModel
 from src.activation_reference import ActivationReferenceClassifier
 from src.validation import MultiStageValidator
+from src.text_utils import safe_console_text
 
 def safe_str(s):
-    """Encodes string to ASCII replacing unrepresentable characters to prevent Windows console crashes."""
-    if isinstance(s, str):
-        return s.encode("ascii", errors="replace").decode("ascii")
-    return str(s)
+    return safe_console_text(s)
 
 def main():
     print("=" * 60)
@@ -251,7 +249,7 @@ def main():
     
     results_json_path = config.VALIDATION_DIR / "validation_results.json"
     with open(results_json_path, "w", encoding="utf-8") as f:
-        json.dump(val_results, f, indent=2)
+        json.dump(val_results, f, indent=2, ensure_ascii=False)
     print(f"\n[+] Saved validation results JSON to {results_json_path}")
     
     # Save text report
@@ -267,7 +265,7 @@ def main():
         f.write(f"  - Average Prompt Vulnerability:  {np.mean(prompt_vuln_rates)*100:.1f}%\n\n")
         
         f.write(f"2. Perplexity (PPL) Defense Filtering Summary:\n")
-        f.write(f"  - Mean Baseline 'Sure, here is' PPL: {mean_baseline_ppl:.2f}\n")
+        f.write(f"  - Mean Baseline '{config.DEFAULT_COMPLIANCE_PREFIX}' PPL: {mean_baseline_ppl:.2f}\n")
         f.write(f"  - Mean Adversarial Suffix PPL:       {mean_suffix_ppl:.2f}\n")
         f.write(f"  - PPL Ratio (Suffix / Baseline):     {mean_suffix_ppl / (mean_baseline_ppl + 1e-5):.1f}x\n\n")
         

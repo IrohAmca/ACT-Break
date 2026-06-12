@@ -2,6 +2,7 @@ import random
 import torch
 from src.token_gradients import compute_token_gradients
 from src.loss_functions import compute_loss
+from src.text_utils import safe_console_text
 
 class GCGOptimizer:
     def __init__(self, hooked_model, direction_vecs, direction_layers, best_layer,
@@ -373,9 +374,8 @@ class GCGOptimizer:
         """
         Full optimization loop for a prompt.
         """
-        prompt_safe = prompt.encode('ascii', errors='replace').decode('ascii')
         n_layers = len(self.direction_layers)
-        print(f"\n[*] Optimizing suffix for prompt: {prompt_safe[:60]}...")
+        print(f"\n[*] Optimizing suffix for prompt: {safe_console_text(prompt, 60)}...")
         print(f"    Multi-layer GCG across {n_layers} layers: L{self.direction_layers[0]}-L{self.direction_layers[-1]}")
         
         losses = []
@@ -390,7 +390,7 @@ class GCGOptimizer:
             activation_losses.append(step_res["activation_loss"])
             
             if step_idx % 10 == 0 or step_idx == 1:
-                suffix_safe = step_res['suffix'][:40].encode('ascii', errors='replace').decode('ascii')
+                suffix_safe = safe_console_text(step_res["suffix"], 40)
                 print(
                     f"  Step {step_idx:03d} | Loss: {loss_val:.4f} "
                     f"| CE: {step_res['target_loss']:.4f} "
@@ -400,7 +400,7 @@ class GCGOptimizer:
                 
             if step_idx % check_interval == 0:
                 success, response, forced, generated = self.check_success(prompt)
-                resp_safe = response.replace(chr(10), ' ')[:50].encode('ascii', errors='replace').decode('ascii')
+                resp_safe = safe_console_text(response, 50)
                 print(f"  [Check] Forced-target success: {success} | Response snippet: {resp_safe}...")
                 if success:
                     print(f"[+] Early stopping at step {step_idx}: forced-target activation success.")

@@ -14,7 +14,11 @@ def main():
     print("=" * 60)
 
     download_advbench()
-    prompts = load_prompts(str(config.ADVBENCH_PATH), max_prompts=config.MAX_PROMPTS)
+    prompts = load_prompts(
+        str(config.ADVBENCH_PATH),
+        max_prompts=config.MAX_PROMPTS,
+        language=config.ADVBENCH_LANGUAGE,
+    )
 
     model = HookedModel(
         model_name=config.MODEL_NAME,

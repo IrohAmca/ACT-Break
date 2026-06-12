@@ -17,11 +17,7 @@ from src.activation_measurements import (
 )
 from src.activation_reference import ActivationReferenceClassifier
 from src.gcg_optimizer import GCGOptimizer
-
-
-def safe_print(text: str):
-    """Print ASCII-safe text to avoid cp1254 encoding crashes on Windows."""
-    print(text.encode("ascii", errors="replace").decode("ascii"))
+from src.text_utils import safe_console_text, safe_print
 
 
 def save_incremental(results: list, output_dir: Path):
@@ -148,7 +144,11 @@ def main():
     print("=" * 60)
 
     # 1. Load prompts
-    prompts_data = load_prompts(str(config.ADVBENCH_PATH), max_prompts=config.OPT_NUM_PROMPTS)
+    prompts_data = load_prompts(
+        str(config.ADVBENCH_PATH),
+        max_prompts=config.OPT_NUM_PROMPTS,
+        language=config.ADVBENCH_LANGUAGE,
+    )
     prompts = [p["goal"] for p in prompts_data]
 
     # 2. Load multi-layer direction vectors
@@ -202,8 +202,7 @@ def main():
     results = []
 
     for idx, prompt in enumerate(prompts):
-        prompt_safe = prompt.encode("ascii", errors="replace").decode("ascii")
-        print(f"\n[#{idx+1}/{len(prompts)}] Prompt: {prompt_safe[:60]}...")
+        print(f"\n[#{idx+1}/{len(prompts)}] Prompt: {safe_console_text(prompt, 60)}...")
 
         optimizer = GCGOptimizer(
             hooked_model=model,
@@ -244,7 +243,7 @@ def main():
         results.append(result_entry)
 
         status_str = "FORCED-TARGET SUCCESS" if opt_res["success"] else "FAILED"
-        res_safe = opt_res["response"].replace(chr(10), " ")[:70].encode("ascii", errors="replace").decode("ascii")
+        res_safe = safe_console_text(opt_res["response"], 70)
         print(f"[Result] {status_str} | Steps: {opt_res['steps']} | Response: {res_safe}...")
 
         # Incremental save after each prompt

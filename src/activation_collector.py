@@ -1,18 +1,34 @@
+from __future__ import annotations
+
 import csv
-import torch
 from tqdm import tqdm
 
-def load_prompts(csv_path: str, max_prompts: int | None = None) -> list[dict]:
+def load_prompts(csv_path: str, max_prompts: int | None = None, language: str | None = None) -> list[dict]:
+    language = (language or "en").lower()
+    goal_column = "goal_tr" if language == "tr" else "goal"
+    target_column = "target_tr" if language == "tr" else "target"
+
     prompts = []
     with open(csv_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
+        fieldnames = set(reader.fieldnames or [])
+        if goal_column not in fieldnames or target_column not in fieldnames:
+            if language == "tr" and {"goal", "target"}.issubset(fieldnames):
+                goal_column = "goal"
+                target_column = "target"
+            else:
+                raise ValueError(
+                    f"{csv_path} must contain `{goal_column}` and `{target_column}` columns "
+                    f"for language={language!r}. Found columns: {sorted(fieldnames)}"
+                )
+
         for row in reader:
-            prompts.append({"goal": row["goal"], "target": row["target"]})
+            prompts.append({"goal": row[goal_column], "target": row[target_column]})
 
     if max_prompts is not None:
         prompts = prompts[:max_prompts]
 
-    print(f"[+] Loaded {len(prompts)} prompts from {csv_path}")
+    print(f"[+] Loaded {len(prompts)} prompts from {csv_path} ({language}, {goal_column}/{target_column})")
     return prompts
 
 def extract_last_token_activation(store, target_layers: list[int]) -> dict[int, torch.Tensor]:
@@ -39,6 +55,8 @@ def first_n_decoded_tokens(tokenizer, text: str, token_count: int) -> str:
 
 def collect_activations(hooked_model, prompts: list[dict], target_layers: list[int],
                         compliance_prefix: str, max_new_tokens: int = 20):
+    import torch
+
     all_activations = {layer: [] for layer in target_layers}
     all_labels = []
     refusal_responses = []
@@ -132,6 +150,8 @@ def save_activations(result: dict, output_path: str):
     print(f"[+] Saved activations to: {output_path} ({os.path.getsize(output_path) / (1024 * 1024):.1f} MB)")
 
 def load_activations(path: str) -> dict:
+    import torch
+
     data = torch.load(path, weights_only=False)
     n_samples = len(data["labels"])
     n_layers = len(data["activations"])

@@ -46,7 +46,10 @@ ADVBENCH_URL = (
     "https://raw.githubusercontent.com/llm-attacks/llm-attacks/"
     "main/data/advbench/harmful_behaviors.csv"
 )
-ADVBENCH_PATH = DATA_DIR / "harmful_prompts.csv"
+ADVBENCH_LANGUAGE = os.getenv("ACT_BREAK_ADVBENCH_LANGUAGE", "en").lower()
+ADVBENCH_ENGLISH_PATH = DATA_DIR / "harmful_prompts.csv"
+ADVBENCH_TURKISH_PATH = DATA_DIR / "harmful_prompts_tr.csv"
+ADVBENCH_PATH = ADVBENCH_TURKISH_PATH if ADVBENCH_LANGUAGE == "tr" else ADVBENCH_ENGLISH_PATH
 
 # === Module 2: Jailbreak Suffix Discovery ===
 

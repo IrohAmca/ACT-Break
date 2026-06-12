@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from src.activation_measurements import track_generation_trajectory_text
+from src.text_utils import safe_console_text
 
 class MultiStageValidator:
     """
@@ -76,8 +77,7 @@ class MultiStageValidator:
         print("    (Using activation projection for classification)")
         
         for p_idx, prompt in enumerate(prompts):
-            prompt_safe = prompt.encode("ascii", errors="replace").decode("ascii")
-            print(f"[*] Testing Prompt {p_idx+1}: {prompt_safe[:50]}...")
+            print(f"[*] Testing Prompt {p_idx+1}: {safe_console_text(prompt, 50)}...")
             
             for s_idx, suffix in enumerate(suffixes):
                 generation = track_generation_trajectory_text(

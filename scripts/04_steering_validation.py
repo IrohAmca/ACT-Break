@@ -11,6 +11,7 @@ from src.activation_steering import ActivationSteerer
 from src.activation_collector import load_prompts
 from src.activation_measurements import track_generation_trajectory_text
 from src.activation_reference import ActivationReferenceClassifier
+from src.text_utils import safe_console_text
 
 def main():
     print("=" * 60)
@@ -18,7 +19,11 @@ def main():
     print("=" * 60)
 
     # 1. Load prompts
-    prompts_data = load_prompts(str(config.ADVBENCH_PATH), max_prompts=config.STEERING_NUM_PROMPTS)
+    prompts_data = load_prompts(
+        str(config.ADVBENCH_PATH),
+        max_prompts=config.STEERING_NUM_PROMPTS,
+        language=config.ADVBENCH_LANGUAGE,
+    )
     prompts = [p["goal"] for p in prompts_data]
 
     # 2. Load multi-layer direction vectors
@@ -83,8 +88,7 @@ def main():
     success_counts = {alpha: 0 for alpha in alphas}
 
     for idx, prompt in enumerate(prompts):
-        prompt_safe = prompt.encode('ascii', errors='replace').decode('ascii')
-        print(f"\n[#{idx+1}] Prompt: {prompt_safe[:60]}...")
+        print(f"\n[#{idx+1}] Prompt: {safe_console_text(prompt, 60)}...")
         prompt_results = {"prompt": prompt, "sweep": {}}
         
         for alpha in alphas:
@@ -109,7 +113,7 @@ def main():
                 if generation["trajectory"] else -999.0
             )
             
-            snippet = response.replace('\n', ' ').strip()[:50].encode('ascii', errors='replace').decode('ascii')
+            snippet = safe_console_text(response, 50)
             print(
                 f"  alpha={alpha:>2.1f} | {status:<10} "
                 f"(proj={proj_val:+.1f}) | Response: {snippet}..."
@@ -138,7 +142,7 @@ def main():
             "steering_layers": layer_indices,
             "num_steering_layers": n_layers,
             "results": results
-        }, f, indent=2)
+        }, f, indent=2, ensure_ascii=False)
 
     print("\n" + "=" * 60)
     print(f"Sweep Summary (Multi-Layer Steering: {n_layers} layers)")
