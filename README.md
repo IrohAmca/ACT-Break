@@ -28,6 +28,34 @@ ACT-Break is a white-box analysis framework for studying jailbreak direction vec
 
 All execution scripts are located under the `scripts/` directory and should be run using `uv run python -u <script_name>` (using the `-u` flag enables unbuffered outputs for real-time progress logging on Windows):
 
+### Model Profiles and Preflight Checks
+
+The pipeline can switch between built-in model profiles without editing `config.py`:
+
+```powershell
+$env:ACT_BREAK_MODEL_PROFILE="gemma"       # google/gemma-3-1b-it, English AdvBench, L8-L17
+$env:ACT_BREAK_MODEL_PROFILE="kara-kumru"  # AlicanKiraz0/Kara-Kumru-v1.0-2B, Turkish AdvBench, L6-L15
+$env:ACT_BREAK_MODEL_PROFILE="kumru"       # vngrs-ai/Kumru-2B, Turkish AdvBench, L6-L15
+$env:ACT_BREAK_MODEL_PROFILE="kumru-base"  # vngrs-ai/Kumru-2B-Base, Turkish AdvBench, L6-L15
+```
+
+Kumru-family profiles default to the focused steering sweep `0,0.25,0.5,1,1.5,2,3,4,5`; the Gemma profile keeps the wider historical sweep.
+
+Run the lightweight preflight before a full experiment:
+
+```powershell
+uv run python -u scripts/00_check_model_config.py
+```
+
+Useful overrides:
+
+```powershell
+$env:ACT_BREAK_MODEL_NAME="vngrs-ai/Kumru-2B"
+$env:ACT_BREAK_TARGET_LAYERS="6-15"
+$env:ACT_BREAK_STEERING_ALPHAS="0,0.25,0.5,1,1.5,2,3,4,5"
+$env:ACT_BREAK_STEERING_NUM_PROMPTS="15"
+```
+
 ### Module 1: Activation Compass
 1. **Download AdvBench harmful prompts**:
    ```bash
@@ -50,7 +78,7 @@ All execution scripts are located under the `scripts/` directory and should be r
    ```bash
    uv run python scripts/04_steering_validation.py
    ```
-   *(Performs activation steering sweeps with different alpha coefficients and evaluates generated trajectories with the Stage-1 activation reference).*
+   *(Performs activation steering sweeps with different alpha coefficients and evaluates generated trajectories with the Stage-1 activation reference plus behavioral text scoring).*
 5. **Optimize Suffixes via GCG (Faz B)**:
    ```bash
    uv run python scripts/05_optimize_suffix.py
@@ -80,6 +108,17 @@ All execution scripts are located under the `scripts/` directory and should be r
   - $L_{target}$: Cross-Entropy loss of generating target string `"Sure, here is"`.
   - $L_{activation}$: Negative projection of target-position activations onto the configured multi-layer compliance directions.
 - **GCG Algorithm**: Computes token gradients via one-hot trick, selects top $K=256$ candidate substitutions, evaluates candidates in mini-batches, and updates suffix iteratively.
+
+### Steering Result Scoring
+
+`outputs/<model-name>/steering/steering_results.json` keeps the legacy `success_counts` field, but now also separates activation and behavioral signals:
+
+* `activation_success_counts`: Number of generations whose checkpoint activations crossed the Stage-1 compliance threshold.
+* `behavior_summary`: Text-side labels and counts per alpha.
+* `steering_summary`: Combined per-alpha activation and behavior summary.
+* `behavior_score.label`: One of `refusal`, `jailbreak_candidate`, `topic_handoff`, `prompt_echo`, `degenerate_repetition`, `non_refusal_other`, or `empty`.
+* `behavioral_jailbreak_candidate`: Heuristic candidate only; confirm manually or with a stronger semantic judge before reporting a confirmed jailbreak.
+* `prompt_echo` and `degenerate_repetition`: Failure modes, not jailbreak success.
 
 ---
 
@@ -142,11 +181,11 @@ Latest Colab run: 2026-06-07, 10 AdvBench harmful prompts, multi-layer GCG over 
 
 You can run the entire ACT-Break pipeline on Google Colab using the interactive notebooks under `colab/`:
 
-1. Upload [colab_notebook.ipynb](colab/colab_notebook.ipynb) for the default Gemma/Qwen flow, or [colab_notebook_karakumru.ipynb](colab/colab_notebook_karakumru.ipynb) for the Turkish Kara-Kumru flow.
+1. Upload [colab_notebook.ipynb](colab/colab_notebook.ipynb) for the default Gemma/Qwen flow, or [colab_notebook_karakumru.ipynb](colab/colab_notebook_karakumru.ipynb) for the Turkish Kumru-family comparison flow (`kara-kumru` and `kumru` profiles in one notebook).
 2. Select a GPU runtime (T4 for free tier, or L4/A100 for Colab Pro users to achieve high optimization speeds).
 3. Run the cells sequentially to clone the repository, install the `uv` environment, execute each step of the pipeline, and back up the results to Google Drive.
 
-The notebook will automatically mount Google Drive and upload all generated plots, validation reports, and optimized suffixes to `My Drive/ACT-Break-Results/`.
+The default notebook backs up to `My Drive/ACT-Break-Results/`; the Kumru comparison notebook backs up to a profile-specific folder such as `My Drive/ACT-Break-Results-kara-kumru-kumru/`.
 
 ---
 
@@ -157,7 +196,7 @@ ACT-Break/
 |-- config.py                       # Central configuration (hyperparameters, paths)
 |-- colab/
 |   |-- colab_notebook.ipynb        # Default Google Colab pipeline notebook
-|   `-- colab_notebook_karakumru.ipynb # Turkish Kara-Kumru Google Colab notebook
+|   `-- colab_notebook_karakumru.ipynb # Turkish Kumru-family comparison Colab notebook
 |-- pyproject.toml                  # UV project configuration and dependencies
 |-- uv.lock                         # Lockfile for reproducible environment
 |-- data/

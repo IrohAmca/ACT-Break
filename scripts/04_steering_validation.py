@@ -11,7 +11,35 @@ from src.activation_steering import ActivationSteerer
 from src.activation_collector import load_prompts
 from src.activation_measurements import track_generation_trajectory_text
 from src.activation_reference import ActivationReferenceClassifier
+from src.behavior_scoring import score_response, summarize_behavior_scores
 from src.text_utils import safe_console_text
+
+
+def format_alpha(alpha: float | int) -> str:
+    return f"{alpha:g}" if isinstance(alpha, (float, int)) else str(alpha)
+
+
+def summarize_generation_trajectory(generation: dict) -> dict:
+    trajectory = generation.get("trajectory", [])
+    projections = [float(item["projection"]) for item in trajectory]
+    margins = [
+        float(item["decision"]["margin"])
+        for item in trajectory
+        if "decision" in item and "margin" in item["decision"]
+    ]
+    statuses = [item["status"] for item in trajectory]
+
+    return {
+        "checkpoint_count": len(trajectory),
+        "first_projection": projections[0] if projections else -999.0,
+        "max_projection": max(projections) if projections else -999.0,
+        "min_projection": min(projections) if projections else -999.0,
+        "max_margin": max(margins) if margins else -999.0,
+        "min_margin": min(margins) if margins else -999.0,
+        "activation_compliance_checkpoints": statuses.count("Compliance"),
+        "generated_any_compliance": bool(generation.get("generated_any_compliance", False)),
+    }
+
 
 def main():
     print("=" * 60)
@@ -86,12 +114,16 @@ def main():
     alphas = config.STEERING_ALPHAS
 
     success_counts = {alpha: 0 for alpha in alphas}
+    activation_success_counts = {str(alpha): 0 for alpha in alphas}
+    behavior_scores_by_alpha = {str(alpha): [] for alpha in alphas}
 
     for idx, prompt in enumerate(prompts):
         print(f"\n[#{idx+1}] Prompt: {safe_console_text(prompt, 60)}...")
         prompt_results = {"prompt": prompt, "sweep": {}}
         
         for alpha in alphas:
+            alpha_key = str(alpha)
+            alpha_label = format_alpha(alpha)
             steerer.register_hooks(alpha)
             try:
                 generation = track_generation_trajectory_text(
@@ -108,6 +140,9 @@ def main():
 
             response = generation["response"]
             status = "Compliance" if generation["generated_any_compliance"] else "Refusal"
+            trajectory_summary = summarize_generation_trajectory(generation)
+            behavior_score = score_response(prompt, response)
+            behavior_scores_by_alpha[alpha_key].append(behavior_score)
             proj_val = (
                 generation["trajectory"][0]["projection"]
                 if generation["trajectory"] else -999.0
@@ -115,29 +150,66 @@ def main():
             
             snippet = safe_console_text(response, 50)
             print(
-                f"  alpha={alpha:>2.1f} | {status:<10} "
-                f"(proj={proj_val:+.1f}) | Response: {snippet}..."
+                f"  alpha={alpha_label:>5} | {status:<10} "
+                f"(proj={proj_val:+.1f}) | behavior={behavior_score['label']:<22} "
+                f"| overlap={behavior_score['lexical_prompt_overlap']:.2f} "
+                f"| rep={behavior_score['repetition_share']:.2f} "
+                f"| Response: {snippet}..."
             )
 
             
-            prompt_results["sweep"][str(alpha)] = {
+            prompt_results["sweep"][alpha_key] = {
                 "response": response,
                 "status": status,
                 "projection": proj_val,
+                "trajectory_summary": trajectory_summary,
+                "behavior_score": behavior_score,
                 "generation_trajectory": generation,
             }
             
             if status == "Compliance":
                 success_counts[alpha] += 1
+                activation_success_counts[alpha_key] += 1
                 
         results.append(prompt_results)
+
+    behavior_summary = {
+        str(alpha): summarize_behavior_scores(behavior_scores_by_alpha[str(alpha)])
+        for alpha in alphas
+    }
+    steering_summary = {}
+    for alpha in alphas:
+        alpha_key = str(alpha)
+        steering_summary[alpha_key] = {
+            "activation_success_count": activation_success_counts[alpha_key],
+            "activation_success_rate": (
+                activation_success_counts[alpha_key] / len(prompts) if prompts else 0.0
+            ),
+            **behavior_summary[alpha_key],
+        }
 
     # 6. Save results
     output_file = config.STEERING_DIR / "steering_results.json"
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump({
+            "schema_version": "steering_results.behavior_v1",
+            "model_info": {
+                "model_name": config.MODEL_NAME,
+                "model_suffix": config.MODEL_SUFFIX,
+                "model_profile": getattr(config, "MODEL_PROFILE", None),
+                "advbench_language": config.ADVBENCH_LANGUAGE,
+                "target_layers": config.TARGET_LAYERS,
+                "negative_activation_mode": config.NEGATIVE_ACTIVATION_MODE,
+                "compliance_prefix": config.DEFAULT_COMPLIANCE_PREFIX,
+                "refusal_prefix": config.DEFAULT_REFUSAL_PREFIX,
+                "dtype": config.DTYPE,
+                "device": config.DEVICE,
+            },
             "alphas": alphas,
             "success_counts": success_counts,
+            "activation_success_counts": activation_success_counts,
+            "behavior_summary": behavior_summary,
+            "steering_summary": steering_summary,
             "total_prompts": len(prompts),
             "steering_layers": layer_indices,
             "num_steering_layers": n_layers,
@@ -150,7 +222,16 @@ def main():
     for alpha in alphas:
         count = success_counts[alpha]
         rate = count / len(prompts)
-        print(f"  alpha={alpha:>4.1f} : {count:>2}/{len(prompts):>2} ({rate:>6.1%})")
+        alpha_key = str(alpha)
+        alpha_label = format_alpha(alpha)
+        behavior = steering_summary[alpha_key]
+        print(
+            f"  alpha={alpha_label:>5} : act={count:>2}/{len(prompts):>2} ({rate:>6.1%}) "
+            f"| non_refusal={behavior['behavioral_non_refusal']:>2} "
+            f"| jailbreak_candidate={behavior['behavioral_jailbreak_candidate']:>2} "
+            f"| echo={behavior['prompt_echo']:>2} "
+            f"| repeat={behavior['repetition_collapse']:>2}"
+        )
     print("=" * 60)
     print(f"[+] Saved results to {output_file}")
 

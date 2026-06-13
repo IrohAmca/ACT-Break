@@ -3,9 +3,100 @@ os.environ["TORCHDYNAMO_DISABLE"] = "1"
 os.environ["MPLBACKEND"] = "Agg"
 
 from pathlib import Path
+import re
 
-MODEL_NAME = "google/gemma-3-1b-it"
-MODEL_SUFFIX = MODEL_NAME.split("/")[-1]
+
+def _parse_int_list(value: str | None, default: list[int]) -> list[int]:
+    if not value:
+        return list(default)
+
+    value = value.strip().lower()
+    hyphen_range = re.fullmatch(r"(\d+)\s*-\s*(\d+)", value)
+    if hyphen_range:
+        start, end = (int(part) for part in hyphen_range.groups())
+        if end < start:
+            raise ValueError(f"Invalid descending range for ACT_BREAK_TARGET_LAYERS: {value!r}")
+        return list(range(start, end + 1))
+
+    colon_range = re.fullmatch(r"(\d+)\s*:\s*(\d+)", value)
+    if colon_range:
+        start, end = (int(part) for part in colon_range.groups())
+        if end <= start:
+            raise ValueError(f"Invalid empty range for ACT_BREAK_TARGET_LAYERS: {value!r}")
+        return list(range(start, end))
+
+    return [int(part.strip()) for part in value.split(",") if part.strip()]
+
+
+def _parse_float_list(value: str | None, default: list[float | int]) -> list[float | int]:
+    if not value:
+        return list(default)
+    parsed = [float(part.strip()) for part in value.split(",") if part.strip()]
+    return [int(item) if item.is_integer() else item for item in parsed]
+
+
+def _env_int(name: str, default: int | None) -> int | None:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+MODEL_PROFILES = {
+    "gemma": {
+        "model_name": "google/gemma-3-1b-it",
+        "target_layers": list(range(8, 18)),
+        "advbench_language": "en",
+        "negative_activation_mode": "generated",
+        "steering_alphas": [0, 1, 2, 5, 10, 15, 20, 30, 50],
+    },
+    "kara-kumru": {
+        "model_name": "AlicanKiraz0/Kara-Kumru-v1.0-2B",
+        "target_layers": list(range(6, 16)),
+        "advbench_language": "tr",
+        "negative_activation_mode": "forced_refusal",
+        "steering_alphas": [0, 0.25, 0.5, 1, 1.5, 2, 3, 4, 5],
+    },
+    "kumru": {
+        "model_name": "vngrs-ai/Kumru-2B",
+        "target_layers": list(range(6, 16)),
+        "advbench_language": "tr",
+        "negative_activation_mode": "forced_refusal",
+        "steering_alphas": [0, 0.25, 0.5, 1, 1.5, 2, 3, 4, 5],
+    },
+    "kumru-base": {
+        "model_name": "vngrs-ai/Kumru-2B-Base",
+        "target_layers": list(range(6, 16)),
+        "advbench_language": "tr",
+        "negative_activation_mode": "forced_refusal",
+        "steering_alphas": [0, 0.25, 0.5, 1, 1.5, 2, 3, 4, 5],
+    },
+}
+
+
+def _resolve_profile_key() -> str:
+    explicit_profile = os.getenv("ACT_BREAK_MODEL_PROFILE")
+    if explicit_profile:
+        profile_key = explicit_profile.lower()
+        if profile_key not in MODEL_PROFILES:
+            choices = ", ".join(sorted(MODEL_PROFILES))
+            raise ValueError(f"Unknown ACT_BREAK_MODEL_PROFILE={explicit_profile!r}. Choices: {choices}")
+        return profile_key
+
+    requested_model = os.getenv("ACT_BREAK_MODEL_NAME")
+    if requested_model:
+        for key, profile in MODEL_PROFILES.items():
+            if requested_model == profile["model_name"]:
+                return key
+
+    return "gemma"
+
+
+MODEL_PROFILE = _resolve_profile_key()
+_MODEL_PROFILE_DATA = MODEL_PROFILES[MODEL_PROFILE]
+
+MODEL_NAME = os.getenv("ACT_BREAK_MODEL_NAME", _MODEL_PROFILE_DATA["model_name"])
+MODEL_SUFFIX = os.getenv("ACT_BREAK_MODEL_SUFFIX", MODEL_NAME.split("/")[-1])
 
 PROJECT_ROOT = Path(__file__).parent
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / MODEL_SUFFIX
@@ -21,12 +112,18 @@ DATA_DIR = PROJECT_ROOT / "data"
 for d in [DATA_DIR, ACTIVATIONS_DIR, PROBES_DIR, FIGURES_DIR, STEERING_DIR, OPTIMIZATION_DIR, VALIDATION_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
-DTYPE = "float16"
-DEVICE = "cuda"
+DTYPE = os.getenv("ACT_BREAK_DTYPE", "float16")
+DEVICE = os.getenv("ACT_BREAK_DEVICE", "cuda")
 
-TARGET_LAYERS = list(range(8, 18))  # Multi-layer activation reference/objective layers for Gemma-3-1B
+TARGET_LAYERS = _parse_int_list(
+    os.getenv("ACT_BREAK_TARGET_LAYERS"),
+    _MODEL_PROFILE_DATA["target_layers"],
+)
 
-ADVBENCH_LANGUAGE = os.getenv("ACT_BREAK_ADVBENCH_LANGUAGE", "en").lower()
+ADVBENCH_LANGUAGE = os.getenv(
+    "ACT_BREAK_ADVBENCH_LANGUAGE",
+    _MODEL_PROFILE_DATA["advbench_language"],
+).lower()
 
 if ADVBENCH_LANGUAGE == "tr":
     COMPLIANCE_PREFIXES = [
@@ -52,11 +149,14 @@ else:
     ]
 DEFAULT_COMPLIANCE_PREFIX = COMPLIANCE_PREFIXES[0]
 DEFAULT_REFUSAL_PREFIX = REFUSAL_PREFIXES[0]
-NEGATIVE_ACTIVATION_MODE = os.getenv("ACT_BREAK_NEGATIVE_ACTIVATION_MODE", "generated").lower()
+NEGATIVE_ACTIVATION_MODE = os.getenv(
+    "ACT_BREAK_NEGATIVE_ACTIVATION_MODE",
+    _MODEL_PROFILE_DATA["negative_activation_mode"],
+).lower()
 
-MAX_PROMPTS = None
-MAX_NEW_TOKENS = 20
-BATCH_SIZE = 1
+MAX_PROMPTS = _env_int("ACT_BREAK_MAX_PROMPTS", None)
+MAX_NEW_TOKENS = _env_int("ACT_BREAK_MAX_NEW_TOKENS", 20)
+BATCH_SIZE = _env_int("ACT_BREAK_BATCH_SIZE", 1)
 
 TEST_SPLIT = 0.2
 RANDOM_SEED = 42
@@ -105,14 +205,17 @@ LOSS_ALPHA = 1.0                # CE (target token) loss weight
 LOSS_BETA = 0.05                # Activation projection loss weight
 
 # Target
-TARGET_STRING = DEFAULT_COMPLIANCE_PREFIX
+TARGET_STRING = os.getenv("ACT_BREAK_TARGET_STRING", DEFAULT_COMPLIANCE_PREFIX)
 
 # Steering Validation
-STEERING_ALPHAS = [0, 1, 2, 5, 10, 15, 20, 30, 50]
-STEERING_NUM_PROMPTS = 15
+STEERING_ALPHAS = _parse_float_list(
+    os.getenv("ACT_BREAK_STEERING_ALPHAS"),
+    _MODEL_PROFILE_DATA["steering_alphas"],
+)
+STEERING_NUM_PROMPTS = _env_int("ACT_BREAK_STEERING_NUM_PROMPTS", 15)
 
 # Optimization
-OPT_NUM_PROMPTS = 10            # Number of prompts to optimize
+OPT_NUM_PROMPTS = _env_int("ACT_BREAK_OPT_NUM_PROMPTS", 10)
 
 # Paths
 DIRECTION_PATH = OUTPUT_DIR / "direction_probe.pt"

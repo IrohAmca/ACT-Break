@@ -5,13 +5,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+os.environ.setdefault("ACT_BREAK_MODEL_PROFILE", "kara-kumru")
 os.environ["ACT_BREAK_ADVBENCH_LANGUAGE"] = "tr"
 
 import config
 from src.activation_collector import load_prompts
 
 
-MODEL_NAME = "AlicanKiraz0/Kara-Kumru-v1.0-2B"
+MODEL_NAME = config.MODEL_NAME
 REQUIRED_COLUMNS = {"goal", "target", "goal_en", "target_en", "goal_tr", "target_tr"}
 COMPLIANCE_OPENERS = ("elbette", "tabii", "kesinlikle", "memnuniyetle", "işte")
 ENGLISH_MARKERS = ("write ", "create ", "provide ", "give ", "develop ", "explain ", "hack into ")

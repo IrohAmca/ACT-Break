@@ -28,6 +28,7 @@ class HookedModel:
         self.tokenizer = None
         self.store = ActivationStore()
         self._hooks = []
+        self._layers = None
 
     def load(self):
         print(f"[*] Loading model: {self.model_name}")
@@ -45,6 +46,8 @@ class HookedModel:
 
         self.model = AutoModelForCausalLM.from_pretrained(self.model_name, **model_kwargs)
         self.model.eval()
+        self._layers = self._resolve_transformer_layers()
+        self._validate_target_layers(self._layers)
         self.model.generation_config.do_sample = False
         for sample_only_flag in ("temperature", "top_p", "top_k"):
             if hasattr(self.model.generation_config, sample_only_flag):
@@ -53,6 +56,7 @@ class HookedModel:
         self._register_hooks()
         params = sum(p.numel() for p in self.model.parameters()) / 1e6
         print(f"[+] Loaded {self.model_name} ({params:.0f}M parameters)")
+        print(f"[+] Hidden layers: {len(self._layers)} | target layers: {self.target_layers}")
         return self
 
     def _load_tokenizer(self):
@@ -74,9 +78,46 @@ class HookedModel:
                 padding_side="left",
             )
 
+    def _resolve_transformer_layers(self):
+        layer_paths = [
+            ("model.layers", lambda model: model.model.layers),
+            ("transformer.h", lambda model: model.transformer.h),
+            ("gpt_neox.layers", lambda model: model.gpt_neox.layers),
+        ]
+        for _path, getter in layer_paths:
+            try:
+                layers = getter(self.model)
+            except AttributeError:
+                continue
+            if layers is not None:
+                return layers
+
+        model_type = getattr(getattr(self.model, "config", None), "model_type", "unknown")
+        raise TypeError(
+            f"Could not resolve transformer layers for model_type={model_type!r}. "
+            "Add the model's layer path to HookedModel._resolve_transformer_layers()."
+        )
+
+    def _validate_target_layers(self, layers):
+        if not self.target_layers:
+            raise ValueError("target_layers cannot be empty.")
+
+        max_layer = len(layers) - 1
+        invalid_layers = [
+            layer_idx
+            for layer_idx in self.target_layers
+            if layer_idx < 0 or layer_idx > max_layer
+        ]
+        if invalid_layers:
+            raise ValueError(
+                f"Invalid target layers for {self.model_name}: {invalid_layers}. "
+                f"Model has {len(layers)} layers, valid range is 0-{max_layer}."
+            )
+
     def _register_hooks(self):
+        layers = self._layers if self._layers is not None else self._resolve_transformer_layers()
         for layer_idx in self.target_layers:
-            layer = self.model.model.layers[layer_idx]
+            layer = layers[layer_idx]
 
             def make_hook(idx):
                 def hook_fn(module, input, output):
@@ -97,11 +138,16 @@ class HookedModel:
         if assistant_prefix:
             messages.append({"role": "assistant", "content": assistant_prefix})
 
-        return self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=(assistant_prefix is None),
-        )
+        if getattr(self.tokenizer, "chat_template", None):
+            return self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=(assistant_prefix is None),
+            )
+
+        if assistant_prefix:
+            return f"User: {user_message}\nAssistant: {assistant_prefix}"
+        return f"User: {user_message}\nAssistant:"
 
     def tokenize(self, text: str) -> dict:
         inputs = self.tokenizer(text, return_tensors="pt", padding=False)

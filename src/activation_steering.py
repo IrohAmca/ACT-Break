@@ -20,12 +20,17 @@ class ActivationSteerer:
         
         device = self.hooked_model.model.device
         dtype = self.hooked_model.model.dtype
+        layers = (
+            self.hooked_model._layers
+            if getattr(self.hooked_model, "_layers", None) is not None
+            else self.hooked_model._resolve_transformer_layers()
+        )
         
         for layer_idx in self.layer_indices:
             d_vec = self.direction_vecs[layer_idx]
             steer_add = (d_vec.to(device).to(dtype) * alpha)
             
-            layer = self.hooked_model.model.model.layers[layer_idx]
+            layer = layers[layer_idx]
             
             def hook_fn(module, input, output, _steer=steer_add):
                 if isinstance(output, tuple):
