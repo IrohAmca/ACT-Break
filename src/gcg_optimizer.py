@@ -1,4 +1,5 @@
 import random
+import math
 import torch
 from src.behavior_scoring import score_response
 from src.token_gradients import compute_token_gradients
@@ -32,6 +33,15 @@ def behavior_gate_passed(behavior_score: dict) -> bool:
     )
 
 
+def prune_target_length(suffix_length: int, prune_fraction: float, min_tokens: int) -> int:
+    if suffix_length <= 1:
+        return max(1, suffix_length)
+    prune_fraction = min(max(float(prune_fraction), 0.0), 0.95)
+    min_tokens = max(1, int(min_tokens))
+    target = math.ceil(suffix_length * (1.0 - prune_fraction))
+    return max(1, min(suffix_length, max(min_tokens, target)))
+
+
 class GCGOptimizer:
     def __init__(self, hooked_model, direction_vecs, direction_layers, best_layer,
                  suffix_length=20, top_k=256, batch_size=64, mini_batch_size=16,
@@ -40,7 +50,10 @@ class GCGOptimizer:
                  max_coordinate_updates: int = 1, deduplicate_candidates: bool = True,
                  require_behavior_for_early_stop: bool = False,
                  archive_top_n: int = 0, archive_limit: int = 0,
-                 token_distance_weight: float = 0.0):
+                 token_distance_weight: float = 0.0, momentum: float = 0.0,
+                 enable_prune_refine: bool = False, prune_fraction: float = 0.0,
+                 prune_min_tokens: int = 1, prune_refine_steps: int = 0,
+                 prune_max_rel_loss_increase: float = 0.03):
         """
         Multi-layer GCG optimizer.
 
@@ -73,6 +86,13 @@ class GCGOptimizer:
         self.archive_top_n = max(0, int(archive_top_n))
         self.archive_limit = max(0, int(archive_limit))
         self.token_distance_weight = max(0.0, float(token_distance_weight))
+        self.momentum = min(max(float(momentum), 0.0), 0.999)
+        self.enable_prune_refine = enable_prune_refine
+        self.prune_fraction = min(max(float(prune_fraction), 0.0), 0.95)
+        self.prune_min_tokens = max(1, int(prune_min_tokens))
+        self.prune_refine_steps = max(0, int(prune_refine_steps))
+        self.prune_max_rel_loss_increase = max(0.0, float(prune_max_rel_loss_increase))
+        self._momentum_grad = None
         self.candidate_archive = []
         self._archive_suffixes = set()
         self._seen_suffixes = set()
@@ -190,6 +210,24 @@ class GCGOptimizer:
 
         return grad + self.token_distance_weight * distances.to(grad.device, dtype=grad.dtype)
 
+    def _apply_momentum(self, grad: torch.Tensor, suffix_ids: torch.Tensor) -> torch.Tensor:
+        if self.momentum <= 0:
+            return grad
+
+        finite_grad = torch.nan_to_num(grad.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+        grad_norm = finite_grad.norm(dim=1, keepdim=True).clamp_min(1e-6)
+        normalized_grad = finite_grad / grad_norm
+
+        if (
+            self._momentum_grad is None
+            or self._momentum_grad.shape != normalized_grad.shape
+        ):
+            self._momentum_grad = normalized_grad
+        else:
+            self._momentum_grad = self.momentum * self._momentum_grad + normalized_grad
+
+        return self._momentum_grad.to(grad.device, dtype=grad.dtype)
+
     def _position_order(self, grad: torch.Tensor, suffix_ids: torch.Tensor) -> list[int]:
         current_token_grads = grad[
             torch.arange(len(suffix_ids), device=grad.device),
@@ -295,6 +333,68 @@ class GCGOptimizer:
                 for item in self.candidate_archive
             }
 
+    def _evaluate_suffix_candidates(
+        self,
+        prompt: str,
+        target_string: str,
+        candidates: list[torch.Tensor],
+    ) -> tuple[list[float], list[float], list[float]]:
+        if not candidates:
+            return [], [], []
+
+        prefix_ids, _, post_suffix_ids, target_ids = self.build_input(
+            prompt,
+            target_string=target_string,
+        )
+        suffix_len = len(candidates[0])
+        if any(len(candidate) != suffix_len for candidate in candidates):
+            raise ValueError("All suffix candidates in a batch must have the same token length.")
+
+        embed_tokens = self.raw_model.model.embed_tokens
+        prefix_len = len(prefix_ids)
+        post_suffix_len = len(post_suffix_ids)
+        target_len = len(target_ids)
+
+        suffix_slice = slice(prefix_len, prefix_len + suffix_len)
+        target_start = prefix_len + suffix_len + post_suffix_len
+        target_slice = slice(target_start, target_start + target_len)
+
+        candidate_losses = []
+        candidate_target_losses = []
+        candidate_activation_losses = []
+
+        for i in range(0, len(candidates), self.mini_batch_size):
+            mini_batch = candidates[i:i + self.mini_batch_size]
+
+            batch_ids = torch.stack([
+                torch.cat([prefix_ids, cand.to(prefix_ids.device), post_suffix_ids, target_ids])
+                for cand in mini_batch
+            ])
+
+            with torch.no_grad():
+                batch_embeds = embed_tokens(batch_ids)
+                outputs = self.raw_model(inputs_embeds=batch_embeds, output_hidden_states=True)
+
+                losses, target_losses, activation_losses = compute_loss(
+                    logits=outputs.logits,
+                    hidden_states=outputs.hidden_states,
+                    input_ids=batch_ids,
+                    suffix_slice=suffix_slice,
+                    target_slice=target_slice,
+                    direction_vecs=self.direction_vecs,
+                    direction_layers=self.direction_layers,
+                    alpha=self.alpha,
+                    beta=self.beta,
+                    aggregation='mean'
+                )
+                candidate_losses.extend(losses.tolist())
+                candidate_target_losses.extend(target_losses.tolist())
+                candidate_activation_losses.extend(activation_losses.tolist())
+
+            torch.cuda.empty_cache()
+
+        return candidate_losses, candidate_target_losses, candidate_activation_losses
+
     def step(self, prompt: str, step_idx: int = 1) -> dict:
         """
         Executes a single GCG iteration with multi-layer gradient computation.
@@ -317,6 +417,7 @@ class GCGOptimizer:
             beta=self.beta,
             post_suffix_ids=post_suffix_ids
         )
+        grad = self._apply_momentum(grad, suffix_ids)
         
         # 2. Exclude special tokens from candidates
         for special_id in self.tokenizer.all_special_ids:
@@ -331,52 +432,11 @@ class GCGOptimizer:
 
         # 4. Build mostly deterministic candidates, with random fallback for diversity.
         candidates = self._build_candidates(suffix_ids, top_k_indices, position_order)
-        
-        # 5. Evaluate candidates in VRAM-efficient mini-batches
-        embed_tokens = self.raw_model.model.embed_tokens
-        prefix_len = len(prefix_ids)
-        post_suffix_len = len(post_suffix_ids)
-        target_len = len(target_ids)
-        
-        suffix_slice = slice(prefix_len, prefix_len + self.suffix_length)
-        target_start = prefix_len + self.suffix_length + post_suffix_len
-        target_slice = slice(target_start, target_start + target_len)
-        
-        candidate_losses = []
-        candidate_target_losses = []
-        candidate_activation_losses = []
-        
-        for i in range(0, len(candidates), self.mini_batch_size):
-            mini_batch = candidates[i:i + self.mini_batch_size]
-            
-            batch_ids = torch.stack([
-                torch.cat([prefix_ids, cand, post_suffix_ids, target_ids])
-                for cand in mini_batch
-            ])
-            
-            with torch.no_grad():
-                batch_embeds = embed_tokens(batch_ids)
-                outputs = self.raw_model(inputs_embeds=batch_embeds, output_hidden_states=True)
-                
-                # Use aggregation='mean': all layers contribute equally to
-                # candidate scoring, matching the gradient computation.
-                losses, target_losses, activation_losses = compute_loss(
-                    logits=outputs.logits,
-                    hidden_states=outputs.hidden_states,
-                    input_ids=batch_ids,
-                    suffix_slice=suffix_slice,
-                    target_slice=target_slice,
-                    direction_vecs=self.direction_vecs,
-                    direction_layers=self.direction_layers,
-                    alpha=self.alpha,
-                    beta=self.beta,
-                    aggregation='mean'
-                )
-                candidate_losses.extend(losses.tolist())
-                candidate_target_losses.extend(target_losses.tolist())
-                candidate_activation_losses.extend(activation_losses.tolist())
-                
-            torch.cuda.empty_cache()
+
+        # 5. Evaluate candidates in VRAM-efficient mini-batches.
+        candidate_losses, candidate_target_losses, candidate_activation_losses = (
+            self._evaluate_suffix_candidates(prompt, target_string, candidates)
+        )
 
         self._archive_candidates(
             prompt=prompt,
@@ -594,6 +654,235 @@ class GCGOptimizer:
 
         return early_stop_success, generated["response"], forced, generated, behavior, gate_passed
 
+    def _make_result(
+        self,
+        *,
+        steps: int,
+        response: str,
+        losses: list[float],
+        target_losses: list[float],
+        activation_losses: list[float],
+        target_strings_used: list[str],
+        forced: dict,
+        generated: dict,
+        behavior: dict,
+        gate_passed: bool,
+        prune_refine: dict | None = None,
+    ) -> dict:
+        forced_success = bool(forced["is_compliance"])
+        return {
+            "forced_target_success": forced_success,
+            "success": forced_success,
+            "behavior_gate_passed": gate_passed,
+            "steps": steps,
+            "suffix": self.decode_suffix(),
+            "suffix_token_count": int(self.suffix_length),
+            "response": response,
+            "losses": list(losses),
+            "target_losses": list(target_losses),
+            "activation_losses": list(activation_losses),
+            "target_strings": self.target_strings,
+            "target_strings_used": list(target_strings_used),
+            "forced_target": forced,
+            "generation_trajectory": generated,
+            "behavior_score": behavior,
+            "candidate_archive": list(self.candidate_archive),
+            "prune_refine": prune_refine or {"enabled": False},
+            "loss_behavior_gap": forced_success and not gate_passed,
+        }
+
+    def _prune_suffix_tokens(self, prompt: str, target_string: str) -> dict:
+        initial_suffix = self.suffix_ids.clone()
+        initial_length = len(initial_suffix)
+        target_length = prune_target_length(
+            initial_length,
+            self.prune_fraction,
+            self.prune_min_tokens,
+        )
+        summary = {
+            "enabled": True,
+            "attempted": True,
+            "accepted": False,
+            "initial_token_count": int(initial_length),
+            "target_token_count": int(target_length),
+            "pruned_token_count": int(initial_length),
+            "removed_tokens": [],
+            "refine_steps": 0,
+        }
+
+        if target_length >= initial_length:
+            summary["attempted"] = False
+            summary["reason"] = "target length is not shorter than current suffix"
+            return summary
+
+        current = initial_suffix
+        losses, _, _ = self._evaluate_suffix_candidates(prompt, target_string, [current])
+        current_loss = losses[0]
+        summary["initial_loss"] = float(current_loss)
+
+        while len(current) > target_length:
+            candidates = []
+            metadata = []
+            for pos in range(len(current)):
+                candidate = torch.cat([current[:pos], current[pos + 1:]])
+                candidates.append(candidate)
+                metadata.append({
+                    "position": int(pos),
+                    "token": self._decode_ids(current[pos:pos + 1]),
+                })
+
+            candidate_losses, _, _ = self._evaluate_suffix_candidates(
+                prompt,
+                target_string,
+                candidates,
+            )
+            best_idx = min(range(len(candidate_losses)), key=lambda idx: candidate_losses[idx])
+            best_loss = candidate_losses[best_idx]
+            tolerance = abs(current_loss) * self.prune_max_rel_loss_increase
+
+            if best_loss > current_loss + tolerance:
+                summary["stop_reason"] = "loss increase exceeded tolerance"
+                summary["final_loss"] = float(current_loss)
+                break
+
+            removed = metadata[best_idx]
+            removed["loss_before"] = float(current_loss)
+            removed["loss_after"] = float(best_loss)
+            summary["removed_tokens"].append(removed)
+            current = candidates[best_idx]
+            current_loss = best_loss
+        else:
+            summary["stop_reason"] = "target length reached"
+            summary["final_loss"] = float(current_loss)
+
+        if len(current) < initial_length:
+            self.suffix_ids = current.to(self.raw_model.device)
+            self.suffix_length = len(current)
+            self._momentum_grad = None
+            self._seen_suffixes.add(tuple(self.suffix_ids.tolist()))
+
+        summary["pruned_token_count"] = int(len(current))
+        summary["pruned"] = len(current) < initial_length
+        return summary
+
+    def _maybe_prune_and_refine(
+        self,
+        prompt: str,
+        *,
+        steps: int,
+        response: str,
+        losses: list[float],
+        target_losses: list[float],
+        activation_losses: list[float],
+        target_strings_used: list[str],
+        forced: dict,
+        generated: dict,
+        behavior: dict,
+        gate_passed: bool,
+    ) -> dict:
+        original_result = self._make_result(
+            steps=steps,
+            response=response,
+            losses=losses,
+            target_losses=target_losses,
+            activation_losses=activation_losses,
+            target_strings_used=target_strings_used,
+            forced=forced,
+            generated=generated,
+            behavior=behavior,
+            gate_passed=gate_passed,
+        )
+
+        if (
+            not self.enable_prune_refine
+            or self.prune_fraction <= 0
+            or self.suffix_length <= self.prune_min_tokens
+        ):
+            original_result["prune_refine"] = {
+                "enabled": self.enable_prune_refine,
+                "attempted": False,
+            }
+            return original_result
+
+        original_suffix = self.suffix_ids.clone()
+        original_suffix_length = self.suffix_length
+        original_momentum = None if self._momentum_grad is None else self._momentum_grad.clone()
+
+        target_string = forced.get("target_string", self.target_string)
+        prune_summary = self._prune_suffix_tokens(prompt, target_string)
+        if not prune_summary.get("pruned"):
+            original_result["prune_refine"] = prune_summary
+            return original_result
+
+        print(
+            f"  [Prune] {prune_summary['initial_token_count']} -> "
+            f"{prune_summary['pruned_token_count']} tokens "
+            f"({len(prune_summary['removed_tokens'])} removed)"
+        )
+
+        refine_steps_run = 0
+        for refine_idx in range(1, self.prune_refine_steps + 1):
+            refine_steps_run = refine_idx
+            step_res = self.step(prompt, step_idx=steps + refine_idx)
+            losses.append(step_res["loss"])
+            target_losses.append(step_res["target_loss"])
+            activation_losses.append(step_res["activation_loss"])
+            target_strings_used.append(step_res["target_string"])
+
+            if refine_idx == 1 or refine_idx % 10 == 0 or refine_idx == self.prune_refine_steps:
+                suffix_safe = safe_console_text(step_res["suffix"], 40)
+                print(
+                    f"  Prune Refine {refine_idx:03d} | Loss: {step_res['loss']:.4f} "
+                    f"| CE: {step_res['target_loss']:.4f} "
+                    f"| Act: {step_res['activation_loss']:.4f} "
+                    f"| Suffix: {suffix_safe}..."
+                )
+
+        prune_summary["refine_steps"] = refine_steps_run
+        steps += refine_steps_run
+        _, response, forced, generated, behavior, gate_passed = self.check_success(prompt)
+        candidate_result = self._make_result(
+            steps=steps,
+            response=response,
+            losses=losses,
+            target_losses=target_losses,
+            activation_losses=activation_losses,
+            target_strings_used=target_strings_used,
+            forced=forced,
+            generated=generated,
+            behavior=behavior,
+            gate_passed=gate_passed,
+            prune_refine=prune_summary,
+        )
+
+        original_ok = (
+            original_result["forced_target_success"]
+            and (
+                original_result["behavior_gate_passed"]
+                or not self.require_behavior_for_early_stop
+            )
+        )
+        candidate_ok = (
+            candidate_result["forced_target_success"]
+            and (
+                candidate_result["behavior_gate_passed"]
+                or not self.require_behavior_for_early_stop
+            )
+        )
+
+        if candidate_ok or (not original_ok and candidate_result["forced_target_success"]):
+            prune_summary["accepted"] = True
+            candidate_result["prune_refine"] = prune_summary
+            return candidate_result
+
+        self.suffix_ids = original_suffix
+        self.suffix_length = original_suffix_length
+        self._momentum_grad = original_momentum
+        prune_summary["accepted"] = False
+        prune_summary["reject_reason"] = "pruned suffix failed final forced/behavior acceptance checks"
+        original_result["prune_refine"] = prune_summary
+        return original_result
+
     def optimize(self, prompt: str, max_steps=500, check_interval=25) -> dict:
         """
         Full optimization loop for a prompt.
@@ -606,9 +895,16 @@ class GCGOptimizer:
         target_losses = []
         activation_losses = []
         target_strings_used = []
+        completed_steps = 0
+        final_response = None
+        final_forced = None
+        final_generated = None
+        final_behavior = None
+        final_gate_passed = False
         
         for step_idx in range(1, max_steps + 1):
             step_res = self.step(prompt, step_idx=step_idx)
+            completed_steps = step_idx
             loss_val = step_res["loss"]
             losses.append(loss_val)
             target_losses.append(step_res["target_loss"])
@@ -640,44 +936,29 @@ class GCGOptimizer:
                         else "forced-target activation success"
                     )
                     print(f"[+] Early stopping at step {step_idx}: {stop_reason}.")
-                    return {
-                        "forced_target_success": forced_success,
-                        "success": forced_success,
-                        "behavior_gate_passed": gate_passed,
-                        "steps": step_idx,
-                        "suffix": self.decode_suffix(),
-                        "response": response,
-                        "losses": losses,
-                        "target_losses": target_losses,
-                        "activation_losses": activation_losses,
-                        "target_strings": self.target_strings,
-                        "target_strings_used": target_strings_used,
-                        "forced_target": forced,
-                        "generation_trajectory": generated,
-                        "behavior_score": behavior,
-                        "candidate_archive": self.candidate_archive,
-                        "loss_behavior_gap": forced_success and not generated["generated_any_compliance"],
-                    }
+                    final_response = response
+                    final_forced = forced
+                    final_generated = generated
+                    final_behavior = behavior
+                    final_gate_passed = gate_passed
+                    break
 
                     
-        # Final check
-        early_stop_success, response, forced, generated, behavior, gate_passed = self.check_success(prompt)
-        forced_success = bool(forced["is_compliance"])
-        return {
-            "forced_target_success": forced_success,
-            "success": forced_success,
-            "behavior_gate_passed": gate_passed,
-            "steps": max_steps,
-            "suffix": self.decode_suffix(),
-            "response": response,
-            "losses": losses,
-            "target_losses": target_losses,
-            "activation_losses": activation_losses,
-            "target_strings": self.target_strings,
-            "target_strings_used": target_strings_used,
-            "forced_target": forced,
-            "generation_trajectory": generated,
-            "behavior_score": behavior,
-            "candidate_archive": self.candidate_archive,
-            "loss_behavior_gap": forced_success and not generated["generated_any_compliance"],
-        }
+        if final_response is None:
+            _, final_response, final_forced, final_generated, final_behavior, final_gate_passed = (
+                self.check_success(prompt)
+            )
+
+        return self._maybe_prune_and_refine(
+            prompt,
+            steps=completed_steps,
+            response=final_response,
+            losses=losses,
+            target_losses=target_losses,
+            activation_losses=activation_losses,
+            target_strings_used=target_strings_used,
+            forced=final_forced,
+            generated=final_generated,
+            behavior=final_behavior,
+            gate_passed=final_gate_passed,
+        )

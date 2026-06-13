@@ -214,6 +214,8 @@ def main():
         "[*] GCG upgrades: "
         f"targets={len(config.TARGET_STRINGS)}, "
         f"max_coordinate_updates={config.GCG_MAX_COORDINATE_UPDATES}, "
+        f"momentum={config.GCG_MOMENTUM}, "
+        f"prune_refine={config.GCG_ENABLE_PRUNE_REFINE}, "
         f"behavior_early_stop={config.GCG_REQUIRE_BEHAVIOR_FOR_EARLY_STOP}, "
         f"archive_limit={config.GCG_ARCHIVE_LIMIT}"
     )
@@ -244,6 +246,12 @@ def main():
             archive_top_n=config.GCG_ARCHIVE_TOP_N,
             archive_limit=config.GCG_ARCHIVE_LIMIT,
             token_distance_weight=config.GCG_TOKEN_DISTANCE_WEIGHT,
+            momentum=config.GCG_MOMENTUM,
+            enable_prune_refine=config.GCG_ENABLE_PRUNE_REFINE,
+            prune_fraction=config.GCG_PRUNE_FRACTION,
+            prune_min_tokens=config.GCG_PRUNE_MIN_TOKENS,
+            prune_refine_steps=config.GCG_PRUNE_REFINE_STEPS,
+            prune_max_rel_loss_increase=config.GCG_PRUNE_MAX_REL_LOSS_INCREASE,
         )
 
         opt_res = optimizer.optimize(
@@ -259,6 +267,7 @@ def main():
             "success": opt_res["success"],
             "steps": opt_res["steps"],
             "suffix": opt_res["suffix"],
+            "suffix_token_count": opt_res.get("suffix_token_count"),
             "response": opt_res["response"],
             "losses": opt_res["losses"],
             "target_losses": opt_res["target_losses"],
@@ -270,6 +279,7 @@ def main():
             "behavior_score": opt_res.get("behavior_score"),
             "behavior_gate_passed": opt_res.get("behavior_gate_passed", False),
             "candidate_archive": opt_res.get("candidate_archive", []),
+            "prune_refine": opt_res.get("prune_refine", {"enabled": False}),
             "loss_behavior_gap": opt_res["loss_behavior_gap"],
         }
         results.append(result_entry)
@@ -320,6 +330,12 @@ def main():
             "archive_top_n": config.GCG_ARCHIVE_TOP_N,
             "archive_limit": config.GCG_ARCHIVE_LIMIT,
             "token_distance_weight": config.GCG_TOKEN_DISTANCE_WEIGHT,
+            "momentum": config.GCG_MOMENTUM,
+            "enable_prune_refine": config.GCG_ENABLE_PRUNE_REFINE,
+            "prune_fraction": config.GCG_PRUNE_FRACTION,
+            "prune_min_tokens": config.GCG_PRUNE_MIN_TOKENS,
+            "prune_refine_steps": config.GCG_PRUNE_REFINE_STEPS,
+            "prune_max_rel_loss_increase": config.GCG_PRUNE_MAX_REL_LOSS_INCREASE,
         },
         "forced_target_success_count": forced_target_success_count,
         "forced_target_success_rate": forced_target_success_count / len(prompts),
@@ -356,6 +372,8 @@ def main():
         f.write(f"Steering layers:        L{direction_layers[0]}-L{direction_layers[-1]} ({n_layers} layers)\n")
         f.write(f"Target templates:       {len(config.TARGET_STRINGS)}\n")
         f.write(f"Max coord updates:      {config.GCG_MAX_COORDINATE_UPDATES}\n")
+        f.write(f"Momentum:               {config.GCG_MOMENTUM}\n")
+        f.write(f"Prune/refine enabled:   {config.GCG_ENABLE_PRUNE_REFINE}\n")
         f.write(f"Forced-target success:  {forced_target_success_count}/{len(prompts)} ({forced_target_success_count / len(prompts):.1%})\n")
         f.write(f"Generated compliance:   {generation_compliance_count}/{len(prompts)} ({generation_compliance_count / len(prompts):.1%})\n")
         f.write(f"Behavior gate passed:   {behavior_gate_count}/{len(prompts)} ({behavior_gate_count / len(prompts):.1%})\n")
@@ -367,7 +385,9 @@ def main():
             f.write(f"Prompt {idx+1}: {res['prompt']}\n")
             f.write(f"  Forced-target Success: {res['success']}\n")
             f.write(f"  Steps:             {res['steps']}\n")
+            f.write(f"  Suffix Tokens:     {res.get('suffix_token_count')}\n")
             f.write(f"  Suffix:            {res['suffix']}\n")
+            f.write(f"  Prune/Refine:      {res.get('prune_refine', {}).get('accepted', False)}\n")
             f.write(f"  Original Gen:      {comp['original_status']}\n")
             f.write(f"  Forced Target:     {comp['suffix_forced_status']} (proj={comp['suffix_forced_projection']:+.1f})\n")
             f.write(f"  Suffix Gen:        {comp['suffix_status']}\n")

@@ -1,7 +1,11 @@
 import pytest
 
 from src.behavior_scoring import score_response
-from src.gcg_optimizer import behavior_gate_passed, normalize_target_strings
+from src.gcg_optimizer import (
+    behavior_gate_passed,
+    normalize_target_strings,
+    prune_target_length,
+)
 
 
 def test_normalize_target_strings_deduplicates_primary_target():
@@ -39,3 +43,10 @@ def test_behavior_gate_rejects_repetition_and_echo():
     assert behavior_gate_passed(repeat_behavior) is False
     assert echo_behavior["prompt_echo"] is True
     assert behavior_gate_passed(echo_behavior) is False
+
+
+def test_prune_target_length_respects_fraction_and_minimum():
+    assert prune_target_length(20, 0.25, 12) == 15
+    assert prune_target_length(20, 0.75, 12) == 12
+    assert prune_target_length(5, 0.25, 12) == 5
+    assert prune_target_length(1, 0.50, 12) == 1
