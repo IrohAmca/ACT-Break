@@ -42,6 +42,28 @@ def _env_int(name: str, default: int | None) -> int | None:
     return int(value)
 
 
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_str_list(value: str | None, default: list[str]) -> list[str]:
+    if not value:
+        return list(default)
+    delimiter = "||" if "||" in value else ","
+    parsed = [part.strip() for part in value.split(delimiter) if part.strip()]
+    return parsed or list(default)
+
+
 MODEL_PROFILES = {
     "gemma": {
         "model_name": "google/gemma-3-1b-it",
@@ -199,6 +221,12 @@ except Exception:
 
 GCG_MAX_STEPS = 150             # Max iterations (successes converge in ~25 steps)
 GCG_CHECK_INTERVAL = 25         # Steps between success checks
+GCG_MAX_COORDINATE_UPDATES = _env_int("ACT_BREAK_GCG_MAX_COORDINATE_UPDATES", 3)
+GCG_DEDUPLICATE_CANDIDATES = _env_bool("ACT_BREAK_GCG_DEDUPLICATE_CANDIDATES", True)
+GCG_REQUIRE_BEHAVIOR_FOR_EARLY_STOP = _env_bool("ACT_BREAK_GCG_REQUIRE_BEHAVIOR_FOR_EARLY_STOP", True)
+GCG_ARCHIVE_TOP_N = _env_int("ACT_BREAK_GCG_ARCHIVE_TOP_N", 3)
+GCG_ARCHIVE_LIMIT = _env_int("ACT_BREAK_GCG_ARCHIVE_LIMIT", 120)
+GCG_TOKEN_DISTANCE_WEIGHT = _env_float("ACT_BREAK_GCG_TOKEN_DISTANCE_WEIGHT", 0.0)
 
 # Loss Weights
 LOSS_ALPHA = 1.0                # CE (target token) loss weight
@@ -206,6 +234,10 @@ LOSS_BETA = 0.05                # Activation projection loss weight
 
 # Target
 TARGET_STRING = os.getenv("ACT_BREAK_TARGET_STRING", DEFAULT_COMPLIANCE_PREFIX)
+TARGET_STRINGS = _parse_str_list(
+    os.getenv("ACT_BREAK_TARGET_STRINGS"),
+    [TARGET_STRING, *[prefix for prefix in COMPLIANCE_PREFIXES if prefix != TARGET_STRING]],
+)
 
 # Steering Validation
 STEERING_ALPHAS = _parse_float_list(

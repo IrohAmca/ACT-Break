@@ -108,6 +108,8 @@ $env:ACT_BREAK_STEERING_NUM_PROMPTS="15"
   - $L_{target}$: Cross-Entropy loss of generating target string `"Sure, here is"`.
   - $L_{activation}$: Negative projection of target-position activations onto the configured multi-layer compliance directions.
 - **GCG Algorithm**: Computes token gradients via one-hot trick, selects top $K=256$ candidate substitutions, evaluates candidates in mini-batches, and updates suffix iteratively.
+- **GCG Upgrades**: Step 5 now supports a target-template bank (`ACT_BREAK_TARGET_STRINGS`), gradient-index position selection, adaptive multi-coordinate candidate updates (`ACT_BREAK_GCG_MAX_COORDINATE_UPDATES`), candidate deduplication, candidate archiving, and behavior-gated early stopping (`ACT_BREAK_GCG_REQUIRE_BEHAVIOR_FOR_EARLY_STOP`).
+- **Behavior Gate**: Forced-target activation success remains reported as `success` for backward compatibility, but early stopping can require the generated response to pass text-side behavior checks and avoid `prompt_echo` / `degenerate_repetition`.
 
 ### Steering Result Scoring
 

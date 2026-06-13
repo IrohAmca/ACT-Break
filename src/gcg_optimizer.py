@@ -1,14 +1,46 @@
 import random
 import torch
+from src.behavior_scoring import score_response
 from src.token_gradients import compute_token_gradients
 from src.loss_functions import compute_loss
 from src.text_utils import safe_console_text
+
+
+def normalize_target_strings(target_string: str, target_strings: list[str] | None = None) -> list[str]:
+    targets = list(target_strings or [])
+    if target_string:
+        targets.insert(0, target_string)
+
+    deduped = []
+    seen = set()
+    for target in targets:
+        target = target.strip()
+        if target and target not in seen:
+            deduped.append(target)
+            seen.add(target)
+
+    if not deduped:
+        raise ValueError("At least one target string is required for GCG optimization.")
+    return deduped
+
+
+def behavior_gate_passed(behavior_score: dict) -> bool:
+    return bool(
+        behavior_score.get("behavioral_jailbreak_candidate")
+        and not behavior_score.get("prompt_echo")
+        and not behavior_score.get("repetition_collapse")
+    )
+
 
 class GCGOptimizer:
     def __init__(self, hooked_model, direction_vecs, direction_layers, best_layer,
                  suffix_length=20, top_k=256, batch_size=64, mini_batch_size=16,
                  alpha=1.0, beta=0.3, target_string="Sure, here is",
-                 activation_classifier=None):
+                 activation_classifier=None, target_strings: list[str] | None = None,
+                 max_coordinate_updates: int = 1, deduplicate_candidates: bool = True,
+                 require_behavior_for_early_stop: bool = False,
+                 archive_top_n: int = 0, archive_limit: int = 0,
+                 token_distance_weight: float = 0.0):
         """
         Multi-layer GCG optimizer.
 
@@ -32,8 +64,18 @@ class GCGOptimizer:
         self.mini_batch_size = mini_batch_size
         self.alpha = alpha
         self.beta = beta
-        self.target_string = target_string
+        self.target_strings = normalize_target_strings(target_string, target_strings)
+        self.target_string = self.target_strings[0]
         self.activation_classifier = activation_classifier
+        self.max_coordinate_updates = max(1, min(int(max_coordinate_updates), suffix_length))
+        self.deduplicate_candidates = deduplicate_candidates
+        self.require_behavior_for_early_stop = require_behavior_for_early_stop
+        self.archive_top_n = max(0, int(archive_top_n))
+        self.archive_limit = max(0, int(archive_limit))
+        self.token_distance_weight = max(0.0, float(token_distance_weight))
+        self.candidate_archive = []
+        self._archive_suffixes = set()
+        self._seen_suffixes = set()
         
         # Initialize suffix with '!' token repeated
         init_token_ids = self.tokenizer.encode("!", add_special_tokens=False)
@@ -42,16 +84,22 @@ class GCGOptimizer:
         init_id = init_token_ids[0]
         
         self.suffix_ids = torch.tensor([init_id] * self.suffix_length, dtype=torch.long, device=self.raw_model.device)
+        self._seen_suffixes.add(tuple(self.suffix_ids.tolist()))
         
     def decode_suffix(self) -> str:
+        return self._decode_ids(self.suffix_ids)
+
+    def _decode_ids(self, token_ids: torch.Tensor) -> str:
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.detach().cpu().tolist()
         try:
             return self.tokenizer.decode(
-                self.suffix_ids,
+                token_ids,
                 skip_special_tokens=True,
                 clean_up_tokenization_spaces=False,
             )
         except TypeError:
-            return self.tokenizer.decode(self.suffix_ids, skip_special_tokens=True)
+            return self.tokenizer.decode(token_ids, skip_special_tokens=True)
 
     def _split_formatted_user_slot(self, prompt: str) -> tuple[str, str]:
         sentinel = "ACT_BREAK_SUFFIX_SLOT"
@@ -69,7 +117,16 @@ class GCGOptimizer:
         prefix_text, post_suffix_text = formatted.split(sentinel, 1)
         return prefix_text, post_suffix_text
         
-    def build_input(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _select_target_string(self, step_idx: int | None = None) -> str:
+        if step_idx is None:
+            return self.target_string
+        return self.target_strings[(step_idx - 1) % len(self.target_strings)]
+
+    def build_input(
+        self,
+        prompt: str,
+        target_string: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Tokenizes the prompt into prefix/suffix/post-suffix/target segments.
 
@@ -80,7 +137,7 @@ class GCGOptimizer:
 
         prefix_ids = self.tokenizer.encode(prefix_text, add_special_tokens=False)
         post_suffix_ids = self.tokenizer.encode(post_suffix_text, add_special_tokens=False)
-        target_ids = self.tokenizer.encode(self.target_string, add_special_tokens=False)
+        target_ids = self.tokenizer.encode(target_string or self.target_string, add_special_tokens=False)
         
         prefix_tensor = torch.tensor(prefix_ids, dtype=torch.long, device=self.raw_model.device)
         post_suffix_tensor = torch.tensor(post_suffix_ids, dtype=torch.long, device=self.raw_model.device)
@@ -94,8 +151,16 @@ class GCGOptimizer:
             suffix_ids = current_suffix_ids
         return torch.cat([prefix_ids, suffix_ids.to(prefix_ids.device), post_suffix_ids], dim=0).unsqueeze(0)
 
-    def build_forced_target_input_ids(self, prompt: str, suffix_ids: torch.Tensor | None = None) -> torch.Tensor:
-        prefix_ids, current_suffix_ids, post_suffix_ids, target_ids = self.build_input(prompt)
+    def build_forced_target_input_ids(
+        self,
+        prompt: str,
+        suffix_ids: torch.Tensor | None = None,
+        target_string: str | None = None,
+    ) -> torch.Tensor:
+        prefix_ids, current_suffix_ids, post_suffix_ids, target_ids = self.build_input(
+            prompt,
+            target_string=target_string,
+        )
         if suffix_ids is None:
             suffix_ids = current_suffix_ids
         return torch.cat([
@@ -105,11 +170,140 @@ class GCGOptimizer:
             target_ids,
         ], dim=0).unsqueeze(0)
 
-    def step(self, prompt: str) -> dict:
+    def _apply_token_distance_regularization(
+        self,
+        grad: torch.Tensor,
+        suffix_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.token_distance_weight <= 0:
+            return grad
+
+        with torch.no_grad():
+            embedding_matrix = self.raw_model.model.embed_tokens.weight.detach().float()
+            current_embeds = embedding_matrix[suffix_ids.to(embedding_matrix.device)]
+            vocab_norms = embedding_matrix.pow(2).sum(dim=1)
+            current_norms = current_embeds.pow(2).sum(dim=1, keepdim=True)
+            distances = current_norms + vocab_norms.unsqueeze(0) - 2 * current_embeds @ embedding_matrix.T
+            distances = distances.clamp_min(0)
+            scale = distances.mean(dim=1, keepdim=True).clamp_min(1e-6)
+            distances = distances / scale
+
+        return grad + self.token_distance_weight * distances.to(grad.device, dtype=grad.dtype)
+
+    def _position_order(self, grad: torch.Tensor, suffix_ids: torch.Tensor) -> list[int]:
+        current_token_grads = grad[
+            torch.arange(len(suffix_ids), device=grad.device),
+            suffix_ids.to(grad.device),
+        ]
+        eligible = torch.nonzero(current_token_grads > 0, as_tuple=False).flatten()
+        if eligible.numel() == 0:
+            eligible = torch.arange(len(suffix_ids), device=grad.device)
+
+        ordered = eligible[
+            torch.argsort(current_token_grads[eligible], descending=True)
+        ]
+        return [int(pos) for pos in ordered.detach().cpu().tolist()]
+
+    def _build_candidates(
+        self,
+        suffix_ids: torch.Tensor,
+        top_k_indices: torch.Tensor,
+        position_order: list[int],
+    ) -> list[torch.Tensor]:
+        candidates = []
+        step_seen = set()
+        current_key = tuple(suffix_ids.tolist())
+        max_updates = min(self.max_coordinate_updates, max(1, len(position_order)))
+
+        def add_candidate(candidate: torch.Tensor, allow_current: bool = False) -> bool:
+            key = tuple(candidate.tolist())
+            if key == current_key and not allow_current:
+                return False
+            if self.deduplicate_candidates and key in step_seen:
+                return False
+            if self.deduplicate_candidates and key in self._seen_suffixes and key != current_key:
+                return False
+            step_seen.add(key)
+            candidates.append(candidate)
+            return True
+
+        attempts = 0
+        max_attempts = max(self.batch_size * 20, len(position_order) * max_updates * 2)
+        while len(candidates) < self.batch_size and attempts < max_attempts:
+            update_count = 1 + (attempts % max_updates)
+            start = (attempts // max_updates) % max(1, len(position_order))
+            token_rank_base = (
+                attempts // max(1, max_updates * len(position_order))
+            ) % top_k_indices.shape[1]
+
+            candidate = suffix_ids.clone()
+            for offset in range(update_count):
+                pos = position_order[(start + offset) % len(position_order)]
+                token_rank = (token_rank_base + offset) % top_k_indices.shape[1]
+                candidate[pos] = top_k_indices[pos, token_rank]
+
+            add_candidate(candidate)
+            attempts += 1
+
+        random_attempts = 0
+        max_random_attempts = self.batch_size * 40
+        while len(candidates) < self.batch_size and random_attempts < max_random_attempts:
+            update_count = random.randint(1, max_updates)
+            positions = random.sample(position_order, k=min(update_count, len(position_order)))
+            candidate = suffix_ids.clone()
+            for pos in positions:
+                candidate[pos] = random.choice(top_k_indices[pos].tolist())
+            add_candidate(candidate)
+            random_attempts += 1
+
+        add_candidate(suffix_ids.clone(), allow_current=True)
+        return candidates
+
+    def _archive_candidates(
+        self,
+        prompt: str,
+        target_string: str,
+        candidates: list[torch.Tensor],
+        losses: list[float],
+        target_losses: list[float],
+        activation_losses: list[float],
+    ) -> None:
+        if self.archive_top_n <= 0 or self.archive_limit <= 0 or not candidates:
+            return
+
+        ranked = sorted(range(len(candidates)), key=lambda idx: losses[idx])
+        for idx in ranked[: self.archive_top_n]:
+            suffix_text = self._decode_ids(candidates[idx])
+            key = (target_string, suffix_text)
+            if key in self._archive_suffixes:
+                continue
+            self._archive_suffixes.add(key)
+            self.candidate_archive.append({
+                "prompt": prompt,
+                "target_string": target_string,
+                "loss": float(losses[idx]),
+                "target_loss": float(target_losses[idx]),
+                "activation_loss": float(activation_losses[idx]),
+                "suffix": suffix_text,
+            })
+
+        self.candidate_archive.sort(key=lambda item: item["loss"])
+        if len(self.candidate_archive) > self.archive_limit:
+            self.candidate_archive = self.candidate_archive[: self.archive_limit]
+            self._archive_suffixes = {
+                (item["target_string"], item["suffix"])
+                for item in self.candidate_archive
+            }
+
+    def step(self, prompt: str, step_idx: int = 1) -> dict:
         """
         Executes a single GCG iteration with multi-layer gradient computation.
         """
-        prefix_ids, suffix_ids, post_suffix_ids, target_ids = self.build_input(prompt)
+        target_string = self._select_target_string(step_idx)
+        prefix_ids, suffix_ids, post_suffix_ids, target_ids = self.build_input(
+            prompt,
+            target_string=target_string,
+        )
         
         # 1. Compute gradients (now using all target layers)
         grad = compute_token_gradients(
@@ -128,22 +322,15 @@ class GCGOptimizer:
         for special_id in self.tokenizer.all_special_ids:
             if special_id < grad.shape[1]:
                 grad[:, special_id] = float("inf")
-                
-        # 3. For each suffix position, find top-k negative gradient tokens
-        top_k_indices = (-grad).topk(self.top_k, dim=1).indices # [suffix_len, top_k]
-        
-        # 4. Sample candidates by mutating one token of the current suffix at a random position
-        candidates = []
-        for _ in range(self.batch_size):
-            pos = random.randint(0, self.suffix_length - 1)
-            tok = random.choice(top_k_indices[pos].tolist())
-            
-            cand = suffix_ids.clone()
-            cand[pos] = tok
-            candidates.append(cand)
-            
-        # Add the current suffix to candidates to ensure we don't degrade
-        candidates.append(suffix_ids.clone())
+
+        candidate_grad = self._apply_token_distance_regularization(grad, suffix_ids)
+
+        # 3. Find promising replacement tokens and update positions.
+        top_k_indices = (-candidate_grad).topk(self.top_k, dim=1).indices # [suffix_len, top_k]
+        position_order = self._position_order(candidate_grad, suffix_ids)
+
+        # 4. Build mostly deterministic candidates, with random fallback for diversity.
+        candidates = self._build_candidates(suffix_ids, top_k_indices, position_order)
         
         # 5. Evaluate candidates in VRAM-efficient mini-batches
         embed_tokens = self.raw_model.model.embed_tokens
@@ -190,17 +377,30 @@ class GCGOptimizer:
                 candidate_activation_losses.extend(activation_losses.tolist())
                 
             torch.cuda.empty_cache()
+
+        self._archive_candidates(
+            prompt=prompt,
+            target_string=target_string,
+            candidates=candidates,
+            losses=candidate_losses,
+            target_losses=candidate_target_losses,
+            activation_losses=candidate_activation_losses,
+        )
             
         # 6. Select the best candidate suffix
         best_idx = torch.tensor(candidate_losses).argmin().item()
         self.suffix_ids = candidates[best_idx]
+        self._seen_suffixes.add(tuple(self.suffix_ids.tolist()))
         best_loss = candidate_losses[best_idx]
         
         return {
             "loss": best_loss,
             "target_loss": candidate_target_losses[best_idx],
             "activation_loss": candidate_activation_losses[best_idx],
-            "suffix": self.decode_suffix()
+            "suffix": self.decode_suffix(),
+            "target_string": target_string,
+            "candidate_count": len(candidates),
+            "updated_positions": position_order[: self.max_coordinate_updates],
         }
 
     def classify_activation_vector(self, act_vec: torch.Tensor) -> tuple[bool, float, str, dict]:
@@ -257,14 +457,27 @@ class GCGOptimizer:
         inputs = self.model.tokenize(formatted)
         return self.classify_by_activation_ids(inputs["input_ids"])
 
-    def measure_forced_target(self, prompt: str) -> dict:
-        input_ids = self.build_forced_target_input_ids(prompt)
+    def measure_forced_target(self, prompt: str, target_string: str | None = None) -> dict:
+        target_string = target_string or self.target_string
+        input_ids = self.build_forced_target_input_ids(prompt, target_string=target_string)
         is_compliance, proj_val, status, decision = self.classify_by_activation_ids(input_ids, position=-1)
         return {
             "status": status,
             "is_compliance": is_compliance,
             "projection": proj_val,
             "decision": decision,
+            "target_string": target_string,
+        }
+
+    def measure_forced_targets(self, prompt: str) -> dict:
+        measurements = [
+            self.measure_forced_target(prompt, target_string=target_string)
+            for target_string in self.target_strings
+        ]
+        best = max(measurements, key=lambda item: item["projection"])
+        return {
+            **best,
+            "all_targets": measurements,
         }
 
     def generate_response(self, prompt: str, max_new_tokens: int = 40) -> tuple[str, torch.Tensor]:
@@ -359,16 +572,27 @@ class GCGOptimizer:
         This is intentionally separate from behavioral jailbreak success during
         free generation, which is tracked in `generated_any_compliance`.
         """
-        forced = self.measure_forced_target(prompt)
+        forced = self.measure_forced_targets(prompt)
         generated = self.track_generation_trajectory(prompt, max_new_tokens=40)
+        behavior = score_response(prompt, generated["response"])
+        gate_passed = behavior_gate_passed(behavior)
 
         proj_str = f"proj={forced['projection']:+.1f}"
+        label = behavior["label"]
         print(
             f"    [ForcedTarget] {forced['status'].upper()} ({proj_str}) "
-            f"| [GeneratedAny] {generated['generated_any_compliance']}"
+            f"| [GeneratedAny] {generated['generated_any_compliance']} "
+            f"| [Behavior] {label}"
         )
 
-        return forced["is_compliance"], generated["response"], forced, generated
+        objective_success = forced["is_compliance"]
+        early_stop_success = (
+            objective_success and gate_passed
+            if self.require_behavior_for_early_stop
+            else objective_success
+        )
+
+        return early_stop_success, generated["response"], forced, generated, behavior, gate_passed
 
     def optimize(self, prompt: str, max_steps=500, check_interval=25) -> dict:
         """
@@ -381,13 +605,15 @@ class GCGOptimizer:
         losses = []
         target_losses = []
         activation_losses = []
+        target_strings_used = []
         
         for step_idx in range(1, max_steps + 1):
-            step_res = self.step(prompt)
+            step_res = self.step(prompt, step_idx=step_idx)
             loss_val = step_res["loss"]
             losses.append(loss_val)
             target_losses.append(step_res["target_loss"])
             activation_losses.append(step_res["activation_loss"])
+            target_strings_used.append(step_res["target_string"])
             
             if step_idx % 10 == 0 or step_idx == 1:
                 suffix_safe = safe_console_text(step_res["suffix"], 40)
@@ -395,42 +621,63 @@ class GCGOptimizer:
                     f"  Step {step_idx:03d} | Loss: {loss_val:.4f} "
                     f"| CE: {step_res['target_loss']:.4f} "
                     f"| Act: {step_res['activation_loss']:.4f} "
+                    f"| Target: {safe_console_text(step_res['target_string'], 24)} "
                     f"| Suffix: {suffix_safe}..."
                 )
                 
             if step_idx % check_interval == 0:
-                success, response, forced, generated = self.check_success(prompt)
+                early_stop_success, response, forced, generated, behavior, gate_passed = self.check_success(prompt)
+                forced_success = bool(forced["is_compliance"])
                 resp_safe = safe_console_text(response, 50)
-                print(f"  [Check] Forced-target success: {success} | Response snippet: {resp_safe}...")
-                if success:
-                    print(f"[+] Early stopping at step {step_idx}: forced-target activation success.")
+                print(
+                    f"  [Check] Forced-target success: {forced_success} "
+                    f"| Behavior gate: {gate_passed} | Response snippet: {resp_safe}..."
+                )
+                if early_stop_success:
+                    stop_reason = (
+                        "forced-target + behavior gate"
+                        if self.require_behavior_for_early_stop
+                        else "forced-target activation success"
+                    )
+                    print(f"[+] Early stopping at step {step_idx}: {stop_reason}.")
                     return {
-                        "forced_target_success": True,
-                        "success": True,
+                        "forced_target_success": forced_success,
+                        "success": forced_success,
+                        "behavior_gate_passed": gate_passed,
                         "steps": step_idx,
                         "suffix": self.decode_suffix(),
                         "response": response,
                         "losses": losses,
                         "target_losses": target_losses,
                         "activation_losses": activation_losses,
+                        "target_strings": self.target_strings,
+                        "target_strings_used": target_strings_used,
                         "forced_target": forced,
                         "generation_trajectory": generated,
-                        "loss_behavior_gap": success and not generated["generated_any_compliance"],
+                        "behavior_score": behavior,
+                        "candidate_archive": self.candidate_archive,
+                        "loss_behavior_gap": forced_success and not generated["generated_any_compliance"],
                     }
 
                     
         # Final check
-        success, response, forced, generated = self.check_success(prompt)
+        early_stop_success, response, forced, generated, behavior, gate_passed = self.check_success(prompt)
+        forced_success = bool(forced["is_compliance"])
         return {
-            "forced_target_success": success,
-            "success": success,
+            "forced_target_success": forced_success,
+            "success": forced_success,
+            "behavior_gate_passed": gate_passed,
             "steps": max_steps,
             "suffix": self.decode_suffix(),
             "response": response,
             "losses": losses,
             "target_losses": target_losses,
             "activation_losses": activation_losses,
+            "target_strings": self.target_strings,
+            "target_strings_used": target_strings_used,
             "forced_target": forced,
             "generation_trajectory": generated,
-            "loss_behavior_gap": success and not generated["generated_any_compliance"],
+            "behavior_score": behavior,
+            "candidate_archive": self.candidate_archive,
+            "loss_behavior_gap": forced_success and not generated["generated_any_compliance"],
         }
